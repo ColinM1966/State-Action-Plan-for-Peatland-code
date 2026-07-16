@@ -1,0 +1,2230 @@
+# ============================================================
+# RSPO CONCESSION AREA BY COMPANY, MEMBER CATEGORY,
+# PHU AND PEAT DEFINITION
+#
+# RSPO fields:
+#   parent
+#   MemeberCat
+#
+# Peat definitions:
+#   DoA = Sapi, Klias, Sipitang and Usukan
+#   SFD = Klias and Sipitang
+#
+# Outputs:
+#   - company overlap results in long format
+#   - company overlap results in wide format
+#   - extent-level RSPO summary and reconciliation
+#   - company/member-category audit
+#   - soil-association audit
+#   - processing errors
+# ============================================================
+
+
+# ============================================================
+# 1. Required packages
+# ============================================================
+
+required_packages <- c(
+  "sf",
+  "dplyr",
+  "purrr",
+  "stringr",
+  "tidyr",
+  "readr",
+  "tibble"
+)
+
+packages_to_install <- required_packages[
+  !required_packages %in%
+    rownames(installed.packages())
+]
+
+if (length(packages_to_install) > 0) {
+  install.packages(
+    packages_to_install,
+    dependencies = TRUE
+  )
+}
+
+
+# ============================================================
+# 2. Load packages
+# ============================================================
+
+library(sf)
+library(dplyr)
+library(purrr)
+library(stringr)
+library(tidyr)
+library(readr)
+library(tibble)
+
+
+# ============================================================
+# 3. Input paths
+# ============================================================
+
+rspo_path <- paste0(
+  "C:/Users/User/Documents/Peatland/GIS/",
+  "Cadestral_LandClass/",
+  "RSPO_oil_Palm_Sabah.gpkg"
+)
+
+phu_folder <- paste0(
+  "C:/Users/User/Documents/Peatland/GIS/",
+  "PHU-extent"
+)
+
+sabah_peat_path <- paste0(
+  "C:/Users/User/Documents/Peatland/GIS/",
+  "PealandSabah.shp"
+)
+
+output_folder <- paste0(
+  "C:/Users/User/Documents/Peatland/GIS/",
+  "RSPO-PHU-peat-results"
+)
+
+
+# ============================================================
+# 4. Create output folder
+# ============================================================
+
+if (!dir.exists(output_folder)) {
+  dir.create(
+    output_folder,
+    recursive = TRUE
+  )
+}
+
+
+# ============================================================
+# 5. Check input files
+# ============================================================
+
+if (!file.exists(rspo_path)) {
+  stop(
+    paste(
+      "RSPO GeoPackage not found:",
+      rspo_path
+    )
+  )
+}
+
+if (!dir.exists(phu_folder)) {
+  stop(
+    paste(
+      "PHU folder not found:",
+      phu_folder
+    )
+  )
+}
+
+if (!file.exists(sabah_peat_path)) {
+  stop(
+    paste(
+      "Sabah peat shapefile not found:",
+      sabah_peat_path
+    )
+  )
+}
+
+phu_files <- list.files(
+  path = phu_folder,
+  pattern = "\\.gpkg$",
+  full.names = TRUE,
+  ignore.case = TRUE
+)
+
+if (length(phu_files) == 0) {
+  stop(
+    paste(
+      "No PHU GeoPackages were found in:",
+      phu_folder
+    )
+  )
+}
+
+
+# ============================================================
+# 6. Analysis settings
+#
+# EPSG:32650 is UTM Zone 50N and uses metre units.
+# It is suitable for area calculations across Sabah.
+# ============================================================
+
+analysis_crs <- 32650
+
+doa_peat_associations <- c(
+  "SAPI",
+  "KLIAS",
+  "SIPITANG",
+  "USUKAN"
+)
+
+sfd_peat_associations <- c(
+  "KLIAS",
+  "SIPITANG"
+)
+
+
+# ============================================================
+# 7. Text-cleaning functions
+# ============================================================
+
+clean_text <- function(x) {
+  
+  x |>
+    as.character() |>
+    stringr::str_squish() |>
+    stringr::str_to_upper()
+}
+
+
+clean_category_value <- function(x) {
+  
+  cleaned <- x |>
+    as.character() |>
+    stringr::str_squish()
+  
+  cleaned[
+    is.na(cleaned) |
+      cleaned == ""
+  ] <- "Not recorded"
+  
+  cleaned
+}
+
+
+normalise_field_name <- function(x) {
+  
+  x |>
+    as.character() |>
+    stringr::str_to_upper() |>
+    stringr::str_replace_all(
+      "[^A-Z0-9]",
+      ""
+    )
+}
+
+
+# ============================================================
+# 8. Find a field using possible aliases
+# ============================================================
+
+find_field_name <- function(
+    spatial_object,
+    possible_names) {
+  
+  existing_names <- names(
+    spatial_object
+  )
+  
+  normalised_existing <- normalise_field_name(
+    existing_names
+  )
+  
+  normalised_possible <- normalise_field_name(
+    possible_names
+  )
+  
+  matching_position <- which(
+    normalised_existing %in%
+      normalised_possible
+  )
+  
+  if (length(matching_position) == 0) {
+    return(NA_character_)
+  }
+  
+  existing_names[
+    matching_position[1]
+  ]
+}
+
+
+# ============================================================
+# 9. Standardise a field name
+# ============================================================
+
+standardise_field_name <- function(
+    spatial_object,
+    possible_names,
+    new_name) {
+  
+  existing_field <- find_field_name(
+    spatial_object,
+    possible_names
+  )
+  
+  if (is.na(existing_field)) {
+    stop(
+      paste(
+        "Could not find a required field.",
+        "Expected one of:",
+        paste(
+          possible_names,
+          collapse = ", "
+        )
+      )
+    )
+  }
+  
+  if (existing_field != new_name) {
+    
+    names(spatial_object)[
+      names(spatial_object) ==
+        existing_field
+    ] <- new_name
+  }
+  
+  spatial_object
+}
+
+
+# ============================================================
+# 10. Match SO_ASSOCIA values
+#
+# This allows values such as:
+#   Klias
+#   Klias Association
+#   KLIAS SOIL ASSOCIATION
+#   Klias / Sipitang
+# ============================================================
+
+matches_soil_association <- function(
+    soil_values,
+    target_associations) {
+  
+  cleaned_values <- clean_text(
+    soil_values
+  )
+  
+  association_pattern <- paste0(
+    "\\b(",
+    paste(
+      target_associations,
+      collapse = "|"
+    ),
+    ")\\b"
+  )
+  
+  !is.na(cleaned_values) &
+    stringr::str_detect(
+      cleaned_values,
+      association_pattern
+    )
+}
+
+
+# ============================================================
+# 11. Repair polygon geometry
+#
+# This function:
+#   - removes Z and M dimensions;
+#   - removes missing and empty geometry;
+#   - repairs invalid geometry;
+#   - extracts polygon parts;
+#   - optionally applies a zero-distance buffer;
+#   - removes zero-area remnants;
+#   - does not assume the geometry column is named geometry.
+# ============================================================
+
+repair_polygon_geometry <- function(
+    spatial_object,
+    object_name = "spatial object",
+    use_zero_buffer = FALSE,
+    remove_zero_area = FALSE) {
+  
+  if (!inherits(spatial_object, "sf")) {
+    stop(
+      paste(
+        object_name,
+        "is not an sf object."
+      )
+    )
+  }
+  
+  if (is.na(sf::st_crs(spatial_object))) {
+    stop(
+      paste(
+        object_name,
+        "does not have a defined CRS."
+      )
+    )
+  }
+  
+  if (nrow(spatial_object) == 0) {
+    return(spatial_object)
+  }
+  
+  spatial_object <- suppressWarnings(
+    sf::st_zm(
+      spatial_object,
+      drop = TRUE,
+      what = "ZM"
+    )
+  )
+  
+  missing_geometry <- is.na(
+    sf::st_geometry(
+      spatial_object
+    )
+  )
+  
+  spatial_object <- spatial_object[
+    !missing_geometry,
+    ,
+    drop = FALSE
+  ]
+  
+  if (nrow(spatial_object) == 0) {
+    return(spatial_object)
+  }
+  
+  empty_geometry <- tryCatch(
+    sf::st_is_empty(
+      spatial_object
+    ),
+    error = function(e) {
+      rep(
+        FALSE,
+        nrow(spatial_object)
+      )
+    }
+  )
+  
+  spatial_object <- spatial_object[
+    !empty_geometry,
+    ,
+    drop = FALSE
+  ]
+  
+  if (nrow(spatial_object) == 0) {
+    return(spatial_object)
+  }
+  
+  spatial_object <- suppressWarnings(
+    sf::st_make_valid(
+      spatial_object
+    )
+  )
+  
+  spatial_object <- spatial_object[
+    !is.na(
+      sf::st_geometry(
+        spatial_object
+      )
+    ),
+    ,
+    drop = FALSE
+  ]
+  
+  if (nrow(spatial_object) == 0) {
+    return(spatial_object)
+  }
+  
+  spatial_object <- spatial_object[
+    !sf::st_is_empty(
+      spatial_object
+    ),
+    ,
+    drop = FALSE
+  ]
+  
+  if (nrow(spatial_object) == 0) {
+    return(spatial_object)
+  }
+  
+  geometry_types <- as.character(
+    sf::st_geometry_type(
+      spatial_object
+    )
+  )
+  
+  if (
+    any(
+      geometry_types ==
+      "GEOMETRYCOLLECTION"
+    )
+  ) {
+    
+    spatial_object <- suppressWarnings(
+      sf::st_collection_extract(
+        spatial_object,
+        type = "POLYGON",
+        warn = FALSE
+      )
+    )
+  }
+  
+  geometry_types <- as.character(
+    sf::st_geometry_type(
+      spatial_object
+    )
+  )
+  
+  polygon_rows <- geometry_types %in%
+    c(
+      "POLYGON",
+      "MULTIPOLYGON"
+    )
+  
+  spatial_object <- spatial_object[
+    polygon_rows,
+    ,
+    drop = FALSE
+  ]
+  
+  if (nrow(spatial_object) == 0) {
+    return(spatial_object)
+  }
+  
+  if (use_zero_buffer) {
+    
+    buffered_object <- tryCatch(
+      suppressWarnings(
+        sf::st_buffer(
+          spatial_object,
+          dist = 0
+        )
+      ),
+      error = function(e) {
+        NULL
+      }
+    )
+    
+    if (!is.null(buffered_object)) {
+      spatial_object <- buffered_object
+    }
+  }
+  
+  spatial_object <- suppressWarnings(
+    sf::st_make_valid(
+      spatial_object
+    )
+  )
+  
+  spatial_object <- spatial_object[
+    !is.na(
+      sf::st_geometry(
+        spatial_object
+      )
+    ),
+    ,
+    drop = FALSE
+  ]
+  
+  if (nrow(spatial_object) == 0) {
+    return(spatial_object)
+  }
+  
+  spatial_object <- spatial_object[
+    !sf::st_is_empty(
+      spatial_object
+    ),
+    ,
+    drop = FALSE
+  ]
+  
+  if (nrow(spatial_object) == 0) {
+    return(spatial_object)
+  }
+  
+  geometry_types <- as.character(
+    sf::st_geometry_type(
+      spatial_object
+    )
+  )
+  
+  if (
+    any(
+      geometry_types ==
+      "GEOMETRYCOLLECTION"
+    )
+  ) {
+    
+    spatial_object <- suppressWarnings(
+      sf::st_collection_extract(
+        spatial_object,
+        type = "POLYGON",
+        warn = FALSE
+      )
+    )
+  }
+  
+  geometry_types <- as.character(
+    sf::st_geometry_type(
+      spatial_object
+    )
+  )
+  
+  spatial_object <- spatial_object[
+    geometry_types %in%
+      c(
+        "POLYGON",
+        "MULTIPOLYGON"
+      ),
+    ,
+    drop = FALSE
+  ]
+  
+  if (nrow(spatial_object) == 0) {
+    return(spatial_object)
+  }
+  
+  if (remove_zero_area) {
+    
+    polygon_area <- tryCatch(
+      as.numeric(
+        sf::st_area(
+          spatial_object
+        )
+      ),
+      error = function(e) {
+        rep(
+          NA_real_,
+          nrow(spatial_object)
+        )
+      }
+    )
+    
+    keep_rows <- (
+      is.finite(polygon_area) &
+        polygon_area > 0
+    )
+    
+    spatial_object <- spatial_object[
+      keep_rows,
+      ,
+      drop = FALSE
+    ]
+  }
+  
+  spatial_object
+}
+
+
+# ============================================================
+# 12. Prepare a polygon layer for analysis
+# ============================================================
+
+prepare_layer_for_analysis <- function(
+    spatial_object,
+    object_name) {
+  
+  spatial_object <- repair_polygon_geometry(
+    spatial_object = spatial_object,
+    object_name = paste(
+      object_name,
+      "before transformation"
+    ),
+    use_zero_buffer = FALSE,
+    remove_zero_area = FALSE
+  )
+  
+  if (nrow(spatial_object) == 0) {
+    stop(
+      paste(
+        object_name,
+        "contains no usable polygons."
+      )
+    )
+  }
+  
+  spatial_object <- sf::st_transform(
+    spatial_object,
+    crs = analysis_crs
+  )
+  
+  spatial_object <- repair_polygon_geometry(
+    spatial_object = spatial_object,
+    object_name = paste(
+      object_name,
+      "in analysis CRS"
+    ),
+    use_zero_buffer = TRUE,
+    remove_zero_area = TRUE
+  )
+  
+  spatial_object
+}
+
+
+# ============================================================
+# 13. Read RSPO polygon layer
+#
+# The script searches all GeoPackage layers for a polygon layer
+# containing both parent and MemeberCat.
+# ============================================================
+
+read_rspo_gpkg <- function(gpkg_path) {
+  
+  layer_names <- sf::st_layers(
+    gpkg_path
+  )$name
+  
+  if (length(layer_names) == 0) {
+    stop(
+      paste(
+        "No layers were found in:",
+        gpkg_path
+      )
+    )
+  }
+  
+  for (layer_name in layer_names) {
+    
+    layer_object <- tryCatch(
+      sf::st_read(
+        dsn = gpkg_path,
+        layer = layer_name,
+        quiet = TRUE,
+        stringsAsFactors = FALSE
+      ),
+      error = function(e) {
+        NULL
+      }
+    )
+    
+    if (
+      is.null(layer_object) ||
+      !inherits(layer_object, "sf") ||
+      nrow(layer_object) == 0
+    ) {
+      next
+    }
+    
+    parent_field <- find_field_name(
+      layer_object,
+      c(
+        "parent"
+      )
+    )
+    
+    member_field <- find_field_name(
+      layer_object,
+      c(
+        "MemeberCat",
+        "MemberCat",
+        "MemberCategory",
+        "Member_Category"
+      )
+    )
+    
+    if (
+      is.na(parent_field) ||
+      is.na(member_field)
+    ) {
+      next
+    }
+    
+    geometry_types <- unique(
+      as.character(
+        sf::st_geometry_type(
+          layer_object
+        )
+      )
+    )
+    
+    if (
+      any(
+        geometry_types %in%
+        c(
+          "POLYGON",
+          "MULTIPOLYGON",
+          "GEOMETRYCOLLECTION"
+        )
+      )
+    ) {
+      
+      message(
+        "RSPO layer selected: ",
+        layer_name
+      )
+      
+      layer_object <- standardise_field_name(
+        spatial_object = layer_object,
+        possible_names = c(
+          "parent"
+        ),
+        new_name = "Parent_company"
+      )
+      
+      layer_object <- standardise_field_name(
+        spatial_object = layer_object,
+        possible_names = c(
+          "MemeberCat",
+          "MemberCat",
+          "MemberCategory",
+          "Member_Category"
+        ),
+        new_name = "Member_category"
+      )
+      
+      return(layer_object)
+    }
+  }
+  
+  stop(
+    paste(
+      "No polygon layer containing parent and",
+      "MemeberCat was found in:",
+      gpkg_path
+    )
+  )
+}
+
+
+# ============================================================
+# 14. Read a PHU GeoPackage
+#
+# Searches all layers for a polygon layer containing SO_ASSOCIA.
+# ============================================================
+
+read_phu_gpkg <- function(gpkg_file) {
+  
+  layer_names <- sf::st_layers(
+    gpkg_file
+  )$name
+  
+  if (length(layer_names) == 0) {
+    stop(
+      paste(
+        "No layers were found in:",
+        basename(gpkg_file)
+      )
+    )
+  }
+  
+  for (layer_name in layer_names) {
+    
+    layer_object <- tryCatch(
+      sf::st_read(
+        dsn = gpkg_file,
+        layer = layer_name,
+        quiet = TRUE,
+        stringsAsFactors = FALSE
+      ),
+      error = function(e) {
+        NULL
+      }
+    )
+    
+    if (
+      is.null(layer_object) ||
+      !inherits(layer_object, "sf") ||
+      nrow(layer_object) == 0
+    ) {
+      next
+    }
+    
+    soil_field <- find_field_name(
+      layer_object,
+      c(
+        "SO_ASSOCIA"
+      )
+    )
+    
+    if (is.na(soil_field)) {
+      next
+    }
+    
+    geometry_types <- unique(
+      as.character(
+        sf::st_geometry_type(
+          layer_object
+        )
+      )
+    )
+    
+    if (
+      any(
+        geometry_types %in%
+        c(
+          "POLYGON",
+          "MULTIPOLYGON",
+          "GEOMETRYCOLLECTION"
+        )
+      )
+    ) {
+      
+      layer_object <- standardise_field_name(
+        spatial_object = layer_object,
+        possible_names = c(
+          "SO_ASSOCIA"
+        ),
+        new_name = "SO_ASSOCIA"
+      )
+      
+      return(layer_object)
+    }
+  }
+  
+  stop(
+    paste(
+      "No polygon layer containing SO_ASSOCIA",
+      "was found in:",
+      basename(gpkg_file)
+    )
+  )
+}
+
+
+# ============================================================
+# 15. Prepare and dissolve an extent
+#
+# soil_associations = NULL returns the complete input area.
+# ============================================================
+
+prepare_extent <- function(
+    spatial_data,
+    soil_associations = NULL,
+    extent_name = "extent") {
+  
+  extent_data <- spatial_data
+  
+  if (!is.null(soil_associations)) {
+    
+    selected_rows <- matches_soil_association(
+      soil_values =
+        extent_data$SO_ASSOCIA,
+      target_associations =
+        soil_associations
+    )
+    
+    extent_data <- extent_data[
+      selected_rows,
+      ,
+      drop = FALSE
+    ]
+  }
+  
+  if (nrow(extent_data) == 0) {
+    return(NULL)
+  }
+  
+  extent_data <- repair_polygon_geometry(
+    spatial_object = extent_data,
+    object_name = extent_name,
+    use_zero_buffer = TRUE,
+    remove_zero_area = TRUE
+  )
+  
+  if (nrow(extent_data) == 0) {
+    return(NULL)
+  }
+  
+  dissolved_geometry <- suppressWarnings(
+    sf::st_union(
+      sf::st_geometry(
+        extent_data
+      )
+    )
+  )
+  
+  dissolved_extent <- sf::st_sf(
+    extent_id = 1,
+    geom = dissolved_geometry
+  )
+  
+  sf::st_crs(dissolved_extent) <-
+    sf::st_crs(extent_data)
+  
+  dissolved_extent <- repair_polygon_geometry(
+    spatial_object = dissolved_extent,
+    object_name = paste(
+      extent_name,
+      "dissolved"
+    ),
+    use_zero_buffer = TRUE,
+    remove_zero_area = TRUE
+  )
+  
+  dissolved_extent
+}
+
+
+# ============================================================
+# 16. Calculate area in hectares
+# ============================================================
+
+calculate_area_ha <- function(spatial_object) {
+  
+  if (
+    is.null(spatial_object) ||
+    nrow(spatial_object) == 0
+  ) {
+    return(0)
+  }
+  
+  sum(
+    as.numeric(
+      sf::st_area(
+        spatial_object
+      )
+    ),
+    na.rm = TRUE
+  ) / 10000
+}
+
+
+# ============================================================
+# 17. Empty output tables
+# ============================================================
+
+empty_overlap_results <- function() {
+  
+  tibble::tibble(
+    Scope = character(),
+    Area_name = character(),
+    Extent_type = character(),
+    Parent_company = character(),
+    Member_category = character(),
+    Extent_area_ha = numeric(),
+    Company_concession_area_ha = numeric(),
+    Overlap_area_ha = numeric(),
+    Percentage_of_extent = numeric(),
+    Percentage_of_company_concession = numeric()
+  )
+}
+
+
+empty_extent_summary <- function() {
+  
+  tibble::tibble(
+    Scope = character(),
+    Area_name = character(),
+    Extent_type = character(),
+    Extent_area_ha = numeric(),
+    Candidate_company_groups = integer(),
+    Successful_company_groups = integer(),
+    Unique_RSPO_overlap_ha = numeric(),
+    Summed_company_overlap_ha = numeric(),
+    Potential_overlap_between_company_groups_ha =
+      numeric(),
+    Unique_RSPO_overlap_pct_of_extent =
+      numeric(),
+    Status = character()
+  )
+}
+
+
+empty_processing_errors <- function() {
+  
+  tibble::tibble(
+    Scope = character(),
+    Area_name = character(),
+    Extent_type = character(),
+    Parent_company = character(),
+    Member_category = character(),
+    Error_message = character()
+  )
+}
+
+
+# ============================================================
+# 18. Read and prepare RSPO concessions
+# ============================================================
+
+message(
+  "Reading RSPO concessions..."
+)
+
+rspo_original <- read_rspo_gpkg(
+  rspo_path
+)
+
+rspo_original <- rspo_original |>
+  dplyr::mutate(
+    Parent_company =
+      clean_category_value(
+        Parent_company
+      ),
+    Member_category =
+      clean_category_value(
+        Member_category
+      ),
+    RSPO_source_ID =
+      dplyr::row_number()
+  )
+
+message(
+  "Repairing RSPO concession geometries..."
+)
+
+rspo_work <- prepare_layer_for_analysis(
+  spatial_object = rspo_original,
+  object_name = "RSPO concessions"
+)
+
+
+# ============================================================
+# 19. Count source features in each company/category group
+# ============================================================
+
+company_group_counts <- rspo_work |>
+  sf::st_drop_geometry() |>
+  dplyr::count(
+    Parent_company,
+    Member_category,
+    name = "Source_feature_count"
+  )
+
+
+# ============================================================
+# 20. Dissolve concessions by parent company and category
+#
+# This prevents overlapping concessions belonging to the same
+# company/category from being counted twice.
+# ============================================================
+
+message(
+  "Dissolving RSPO concessions by company and member category..."
+)
+
+rspo_by_company <- rspo_work |>
+  dplyr::select(
+    Parent_company,
+    Member_category
+  ) |>
+  dplyr::group_by(
+    Parent_company,
+    Member_category
+  ) |>
+  dplyr::summarise(
+    do_union = TRUE,
+    .groups = "drop"
+  )
+
+rspo_by_company <- repair_polygon_geometry(
+  spatial_object = rspo_by_company,
+  object_name =
+    "RSPO concessions dissolved by company",
+  use_zero_buffer = TRUE,
+  remove_zero_area = TRUE
+)
+
+rspo_by_company <- rspo_by_company |>
+  dplyr::left_join(
+    company_group_counts,
+    by = c(
+      "Parent_company",
+      "Member_category"
+    )
+  )
+
+rspo_by_company$Company_concession_area_ha <-
+  as.numeric(
+    sf::st_area(
+      rspo_by_company
+    )
+  ) / 10000
+
+
+# ============================================================
+# 21. Create one union of all RSPO concessions
+#
+# This is used to calculate unique RSPO area without counting
+# overlaps between different companies more than once.
+# ============================================================
+
+all_rspo_union <- suppressWarnings(
+  sf::st_union(
+    sf::st_geometry(
+      rspo_by_company
+    )
+  )
+)
+
+rspo_footprint <- sf::st_sf(
+  footprint_id = 1,
+  geom = all_rspo_union
+)
+
+sf::st_crs(rspo_footprint) <-
+  sf::st_crs(rspo_by_company)
+
+rspo_footprint <- repair_polygon_geometry(
+  spatial_object = rspo_footprint,
+  object_name = "Complete RSPO footprint",
+  use_zero_buffer = TRUE,
+  remove_zero_area = TRUE
+)
+
+
+# ============================================================
+# 22. Summarise company overlaps for one extent
+# ============================================================
+
+summarise_company_overlap <- function(
+    source_extent,
+    scope_name,
+    area_name,
+    extent_type) {
+  
+  if (
+    is.null(source_extent) ||
+    nrow(source_extent) == 0
+  ) {
+    
+    summary_row <- tibble::tibble(
+      Scope = scope_name,
+      Area_name = area_name,
+      Extent_type = extent_type,
+      Extent_area_ha = 0,
+      Candidate_company_groups = 0L,
+      Successful_company_groups = 0L,
+      Unique_RSPO_overlap_ha = 0,
+      Summed_company_overlap_ha = 0,
+      Potential_overlap_between_company_groups_ha = 0,
+      Unique_RSPO_overlap_pct_of_extent = NA_real_,
+      Status = "No matching extent"
+    )
+    
+    return(
+      list(
+        results = empty_overlap_results(),
+        summary = summary_row,
+        errors = empty_processing_errors()
+      )
+    )
+  }
+  
+  source_extent <- repair_polygon_geometry(
+    spatial_object = source_extent,
+    object_name = paste(
+      area_name,
+      extent_type
+    ),
+    use_zero_buffer = TRUE,
+    remove_zero_area = TRUE
+  )
+  
+  extent_area_ha <- calculate_area_ha(
+    source_extent
+  )
+  
+  candidate_index <- tryCatch(
+    which(
+      lengths(
+        sf::st_intersects(
+          rspo_by_company,
+          source_extent
+        )
+      ) > 0
+    ),
+    error = function(e) {
+      integer()
+    }
+  )
+  
+  if (length(candidate_index) == 0) {
+    
+    summary_row <- tibble::tibble(
+      Scope = scope_name,
+      Area_name = area_name,
+      Extent_type = extent_type,
+      Extent_area_ha = extent_area_ha,
+      Candidate_company_groups = 0L,
+      Successful_company_groups = 0L,
+      Unique_RSPO_overlap_ha = 0,
+      Summed_company_overlap_ha = 0,
+      Potential_overlap_between_company_groups_ha = 0,
+      Unique_RSPO_overlap_pct_of_extent = 0,
+      Status = "No RSPO overlap"
+    )
+    
+    return(
+      list(
+        results = empty_overlap_results(),
+        summary = summary_row,
+        errors = empty_processing_errors()
+      )
+    )
+  }
+  
+  candidate_companies <- rspo_by_company[
+    candidate_index,
+    ,
+    drop = FALSE
+  ]
+  
+  result_parts <- vector(
+    mode = "list",
+    length = nrow(candidate_companies)
+  )
+  
+  error_parts <- vector(
+    mode = "list",
+    length = nrow(candidate_companies)
+  )
+  
+  for (
+    company_number in
+    seq_len(nrow(candidate_companies))
+  ) {
+    
+    company_feature <- candidate_companies[
+      company_number,
+      ,
+      drop = FALSE
+    ]
+    
+    company_name <- as.character(
+      company_feature$Parent_company[1]
+    )
+    
+    member_category <- as.character(
+      company_feature$Member_category[1]
+    )
+    
+    company_total_area <- as.numeric(
+      company_feature$Company_concession_area_ha[1]
+    )
+    
+    intersection_error <- NA_character_
+    
+    intersection_geometry <- tryCatch(
+      suppressWarnings(
+        sf::st_intersection(
+          sf::st_geometry(
+            company_feature
+          ),
+          sf::st_geometry(
+            source_extent
+          )
+        )
+      ),
+      error = function(e) {
+        
+        intersection_error <<-
+          conditionMessage(e)
+        
+        NULL
+      }
+    )
+    
+    if (
+      is.null(intersection_geometry) ||
+      length(intersection_geometry) == 0
+    ) {
+      
+      if (!is.na(intersection_error)) {
+        
+        error_parts[[company_number]] <-
+          tibble::tibble(
+            Scope = scope_name,
+            Area_name = area_name,
+            Extent_type = extent_type,
+            Parent_company = company_name,
+            Member_category =
+              member_category,
+            Error_message =
+              intersection_error
+          )
+      }
+      
+      next
+    }
+    
+    intersection_object <- sf::st_sf(
+      geom = intersection_geometry
+    )
+    
+    sf::st_crs(intersection_object) <-
+      sf::st_crs(source_extent)
+    
+    intersection_object <- tryCatch(
+      repair_polygon_geometry(
+        spatial_object =
+          intersection_object,
+        object_name = paste(
+          company_name,
+          area_name,
+          extent_type
+        ),
+        use_zero_buffer = TRUE,
+        remove_zero_area = TRUE
+      ),
+      error = function(e) {
+        
+        intersection_error <<-
+          conditionMessage(e)
+        
+        NULL
+      }
+    )
+    
+    if (
+      is.null(intersection_object) ||
+      nrow(intersection_object) == 0
+    ) {
+      
+      if (!is.na(intersection_error)) {
+        
+        error_parts[[company_number]] <-
+          tibble::tibble(
+            Scope = scope_name,
+            Area_name = area_name,
+            Extent_type = extent_type,
+            Parent_company = company_name,
+            Member_category =
+              member_category,
+            Error_message =
+              intersection_error
+          )
+      }
+      
+      next
+    }
+    
+    overlap_area_ha <- calculate_area_ha(
+      intersection_object
+    )
+    
+    if (
+      !is.finite(overlap_area_ha) ||
+      overlap_area_ha <= 0
+    ) {
+      next
+    }
+    
+    result_parts[[company_number]] <-
+      tibble::tibble(
+        Scope = scope_name,
+        Area_name = area_name,
+        Extent_type = extent_type,
+        Parent_company = company_name,
+        Member_category =
+          member_category,
+        Extent_area_ha =
+          extent_area_ha,
+        Company_concession_area_ha =
+          company_total_area,
+        Overlap_area_ha =
+          overlap_area_ha,
+        Percentage_of_extent =
+          ifelse(
+            extent_area_ha > 0,
+            overlap_area_ha /
+              extent_area_ha *
+              100,
+            NA_real_
+          ),
+        Percentage_of_company_concession =
+          ifelse(
+            company_total_area > 0,
+            overlap_area_ha /
+              company_total_area *
+              100,
+            NA_real_
+          )
+      )
+  }
+  
+  result_parts <- Filter(
+    Negate(is.null),
+    result_parts
+  )
+  
+  error_parts <- Filter(
+    Negate(is.null),
+    error_parts
+  )
+  
+  if (length(result_parts) > 0) {
+    
+    company_results <- dplyr::bind_rows(
+      result_parts
+    )
+    
+  } else {
+    
+    company_results <-
+      empty_overlap_results()
+  }
+  
+  if (length(error_parts) > 0) {
+    
+    processing_errors <- dplyr::bind_rows(
+      error_parts
+    )
+    
+  } else {
+    
+    processing_errors <-
+      empty_processing_errors()
+  }
+  
+  
+  # ----------------------------------------------------------
+  # Calculate unique RSPO area in the extent
+  # ----------------------------------------------------------
+  
+  unique_overlap_error <- NA_character_
+  
+  unique_overlap_geometry <- tryCatch(
+    suppressWarnings(
+      sf::st_intersection(
+        sf::st_geometry(
+          rspo_footprint
+        ),
+        sf::st_geometry(
+          source_extent
+        )
+      )
+    ),
+    error = function(e) {
+      
+      unique_overlap_error <<-
+        conditionMessage(e)
+      
+      NULL
+    }
+  )
+  
+  if (
+    is.null(unique_overlap_geometry) ||
+    length(unique_overlap_geometry) == 0
+  ) {
+    
+    unique_rspo_area_ha <- 0
+    
+  } else {
+    
+    unique_overlap_object <- sf::st_sf(
+      geom = unique_overlap_geometry
+    )
+    
+    sf::st_crs(unique_overlap_object) <-
+      sf::st_crs(source_extent)
+    
+    unique_overlap_object <-
+      repair_polygon_geometry(
+        spatial_object =
+          unique_overlap_object,
+        object_name = paste(
+          area_name,
+          extent_type,
+          "unique RSPO overlap"
+        ),
+        use_zero_buffer = TRUE,
+        remove_zero_area = TRUE
+      )
+    
+    unique_rspo_area_ha <- calculate_area_ha(
+      unique_overlap_object
+    )
+  }
+  
+  summed_company_overlap_ha <- sum(
+    company_results$Overlap_area_ha,
+    na.rm = TRUE
+  )
+  
+  overlap_between_groups <- max(
+    summed_company_overlap_ha -
+      unique_rspo_area_ha,
+    0
+  )
+  
+  summary_status <- if (
+    !is.na(unique_overlap_error)
+  ) {
+    
+    paste(
+      "Unique-overlap calculation warning:",
+      unique_overlap_error
+    )
+    
+  } else if (
+    nrow(processing_errors) > 0
+  ) {
+    
+    "Completed with company intersection errors"
+    
+  } else {
+    
+    "Completed"
+  }
+  
+  summary_row <- tibble::tibble(
+    Scope = scope_name,
+    Area_name = area_name,
+    Extent_type = extent_type,
+    Extent_area_ha = extent_area_ha,
+    Candidate_company_groups =
+      nrow(candidate_companies),
+    Successful_company_groups =
+      nrow(company_results),
+    Unique_RSPO_overlap_ha =
+      unique_rspo_area_ha,
+    Summed_company_overlap_ha =
+      summed_company_overlap_ha,
+    Potential_overlap_between_company_groups_ha =
+      overlap_between_groups,
+    Unique_RSPO_overlap_pct_of_extent =
+      ifelse(
+        extent_area_ha > 0,
+        unique_rspo_area_ha /
+          extent_area_ha *
+          100,
+        NA_real_
+      ),
+    Status = summary_status
+  )
+  
+  list(
+    results = company_results,
+    summary = summary_row,
+    errors = processing_errors
+  )
+}
+
+
+# ============================================================
+# 23. Process one PHU
+# ============================================================
+
+process_phu_file <- function(gpkg_file) {
+  
+  phu_name <- tools::file_path_sans_ext(
+    basename(gpkg_file)
+  )
+  
+  message(
+    "Processing PHU: ",
+    phu_name
+  )
+  
+  tryCatch(
+    {
+      
+      phu_original <- read_phu_gpkg(
+        gpkg_file
+      )
+      
+      phu_work <- prepare_layer_for_analysis(
+        spatial_object = phu_original,
+        object_name = phu_name
+      )
+      
+      total_phu <- prepare_extent(
+        spatial_data = phu_work,
+        soil_associations = NULL,
+        extent_name = paste(
+          phu_name,
+          "total PHU"
+        )
+      )
+      
+      doa_peat <- prepare_extent(
+        spatial_data = phu_work,
+        soil_associations =
+          doa_peat_associations,
+        extent_name = paste(
+          phu_name,
+          "DoA peat"
+        )
+      )
+      
+      sfd_peat <- prepare_extent(
+        spatial_data = phu_work,
+        soil_associations =
+          sfd_peat_associations,
+        extent_name = paste(
+          phu_name,
+          "SFD peat"
+        )
+      )
+      
+      total_result <- summarise_company_overlap(
+        source_extent = total_phu,
+        scope_name = "PHU",
+        area_name = phu_name,
+        extent_type = "Total PHU"
+      )
+      
+      doa_result <- summarise_company_overlap(
+        source_extent = doa_peat,
+        scope_name = "PHU",
+        area_name = phu_name,
+        extent_type = "DoA peat extent"
+      )
+      
+      sfd_result <- summarise_company_overlap(
+        source_extent = sfd_peat,
+        scope_name = "PHU",
+        area_name = phu_name,
+        extent_type = "SFD peat extent"
+      )
+      
+      list(
+        results = dplyr::bind_rows(
+          total_result$results,
+          doa_result$results,
+          sfd_result$results
+        ),
+        summary = dplyr::bind_rows(
+          total_result$summary,
+          doa_result$summary,
+          sfd_result$summary
+        ),
+        errors = dplyr::bind_rows(
+          total_result$errors,
+          doa_result$errors,
+          sfd_result$errors
+        )
+      )
+    },
+    error = function(e) {
+      
+      list(
+        results = empty_overlap_results(),
+        
+        summary = tibble::tibble(
+          Scope = "PHU",
+          Area_name = phu_name,
+          Extent_type =
+            "All PHU extents",
+          Extent_area_ha = NA_real_,
+          Candidate_company_groups =
+            NA_integer_,
+          Successful_company_groups =
+            NA_integer_,
+          Unique_RSPO_overlap_ha =
+            NA_real_,
+          Summed_company_overlap_ha =
+            NA_real_,
+          Potential_overlap_between_company_groups_ha =
+            NA_real_,
+          Unique_RSPO_overlap_pct_of_extent =
+            NA_real_,
+          Status = paste(
+            "PHU processing error:",
+            conditionMessage(e)
+          )
+        ),
+        
+        errors = tibble::tibble(
+          Scope = "PHU",
+          Area_name = phu_name,
+          Extent_type =
+            "All PHU extents",
+          Parent_company =
+            NA_character_,
+          Member_category =
+            NA_character_,
+          Error_message =
+            conditionMessage(e)
+        )
+      )
+    }
+  )
+}
+
+
+# ============================================================
+# 24. Process all PHUs
+# ============================================================
+
+phu_output_list <- lapply(
+  phu_files,
+  process_phu_file
+)
+
+phu_company_results <- dplyr::bind_rows(
+  lapply(
+    phu_output_list,
+    function(x) {
+      x$results
+    }
+  )
+)
+
+phu_extent_summary <- dplyr::bind_rows(
+  lapply(
+    phu_output_list,
+    function(x) {
+      x$summary
+    }
+  )
+)
+
+phu_processing_errors <- dplyr::bind_rows(
+  lapply(
+    phu_output_list,
+    function(x) {
+      x$errors
+    }
+  )
+)
+
+
+# ============================================================
+# 25. Read and prepare statewide Sabah peat
+# ============================================================
+
+message(
+  "Reading statewide Sabah peat layer..."
+)
+
+sabah_peat_original <- sf::st_read(
+  sabah_peat_path,
+  quiet = TRUE,
+  stringsAsFactors = FALSE
+)
+
+sabah_peat_original <- standardise_field_name(
+  spatial_object = sabah_peat_original,
+  possible_names = c(
+    "SO_ASSOCIA"
+  ),
+  new_name = "SO_ASSOCIA"
+)
+
+sabah_peat_work <- prepare_layer_for_analysis(
+  spatial_object = sabah_peat_original,
+  object_name = "Statewide Sabah peat"
+)
+
+
+# ============================================================
+# 26. Prepare statewide peat definitions
+# ============================================================
+
+sabah_doa_peat <- prepare_extent(
+  spatial_data = sabah_peat_work,
+  soil_associations =
+    doa_peat_associations,
+  extent_name =
+    "Total Sabah DoA peat"
+)
+
+sabah_sfd_peat <- prepare_extent(
+  spatial_data = sabah_peat_work,
+  soil_associations =
+    sfd_peat_associations,
+  extent_name =
+    "Total Sabah SFD peat"
+)
+
+
+# ============================================================
+# 27. Process statewide peat definitions
+# ============================================================
+
+message(
+  "Processing statewide Sabah peat extents..."
+)
+
+sabah_doa_result <- summarise_company_overlap(
+  source_extent = sabah_doa_peat,
+  scope_name = "Sabah peatland",
+  area_name = "Sabah",
+  extent_type =
+    "Total Sabah DoA peat extent"
+)
+
+sabah_sfd_result <- summarise_company_overlap(
+  source_extent = sabah_sfd_peat,
+  scope_name = "Sabah peatland",
+  area_name = "Sabah",
+  extent_type =
+    "Total Sabah SFD peat extent"
+)
+
+
+# ============================================================
+# 28. Combine statewide and PHU results
+# ============================================================
+
+company_overlap_results <- dplyr::bind_rows(
+  phu_company_results,
+  sabah_doa_result$results,
+  sabah_sfd_result$results
+)
+
+extent_summary <- dplyr::bind_rows(
+  phu_extent_summary,
+  sabah_doa_result$summary,
+  sabah_sfd_result$summary
+)
+
+processing_errors <- dplyr::bind_rows(
+  phu_processing_errors,
+  sabah_doa_result$errors,
+  sabah_sfd_result$errors
+)
+
+
+# ============================================================
+# 29. Format company overlap results
+#
+# Only company/category combinations with a positive spatial
+# overlap are included.
+# ============================================================
+
+company_overlap_results_formatted <-
+  company_overlap_results |>
+  dplyr::mutate(
+    Extent_area_ha = round(
+      Extent_area_ha,
+      2
+    ),
+    Company_concession_area_ha = round(
+      Company_concession_area_ha,
+      2
+    ),
+    Overlap_area_ha = round(
+      Overlap_area_ha,
+      2
+    ),
+    Percentage_of_extent = round(
+      Percentage_of_extent,
+      3
+    ),
+    Percentage_of_company_concession = round(
+      Percentage_of_company_concession,
+      3
+    )
+  ) |>
+  dplyr::arrange(
+    Scope,
+    Area_name,
+    Extent_type,
+    Member_category,
+    Parent_company
+  )
+
+
+# ============================================================
+# 30. Format extent summary
+# ============================================================
+
+extent_summary_formatted <- extent_summary |>
+  dplyr::mutate(
+    dplyr::across(
+      c(
+        Extent_area_ha,
+        Unique_RSPO_overlap_ha,
+        Summed_company_overlap_ha,
+        Potential_overlap_between_company_groups_ha
+      ),
+      ~ round(.x, 2)
+    ),
+    Unique_RSPO_overlap_pct_of_extent =
+      round(
+        Unique_RSPO_overlap_pct_of_extent,
+        3
+      )
+  ) |>
+  dplyr::arrange(
+    Scope,
+    Area_name,
+    Extent_type
+  )
+
+
+# ============================================================
+# 31. Create wide-format company table
+# ============================================================
+
+company_overlap_results_wide <-
+  company_overlap_results_formatted |>
+  dplyr::select(
+    Scope,
+    Area_name,
+    Parent_company,
+    Member_category,
+    Extent_type,
+    Overlap_area_ha
+  ) |>
+  tidyr::pivot_wider(
+    names_from = Extent_type,
+    values_from = Overlap_area_ha,
+    values_fill = 0,
+    names_prefix = "Area_ha_"
+  ) |>
+  dplyr::rename_with(
+    function(column_name) {
+      
+      column_name |>
+        stringr::str_replace_all(
+          "[^A-Za-z0-9]+",
+          "_"
+        ) |>
+        stringr::str_replace_all(
+          "^_+|_+$",
+          ""
+        )
+    }
+  )
+
+
+# ============================================================
+# 32. RSPO company/member-category audit
+# ============================================================
+
+rspo_company_audit <- rspo_by_company |>
+  sf::st_drop_geometry() |>
+  dplyr::select(
+    Parent_company,
+    Member_category,
+    Source_feature_count,
+    Company_concession_area_ha
+  ) |>
+  dplyr::mutate(
+    Company_concession_area_ha =
+      round(
+        Company_concession_area_ha,
+        2
+      )
+  ) |>
+  dplyr::arrange(
+    Member_category,
+    Parent_company
+  )
+
+
+# ============================================================
+# 33. SO_ASSOCIA classification audit
+# ============================================================
+
+phu_soil_audit <- purrr::map_dfr(
+  phu_files,
+  function(gpkg_file) {
+    
+    phu_name <- tools::file_path_sans_ext(
+      basename(gpkg_file)
+    )
+    
+    tryCatch(
+      {
+        
+        phu_data <- read_phu_gpkg(
+          gpkg_file
+        )
+        
+        phu_data |>
+          sf::st_drop_geometry() |>
+          dplyr::transmute(
+            Source = phu_name,
+            SO_ASSOCIA =
+              as.character(
+                SO_ASSOCIA
+              ),
+            Included_in_DoA_peat =
+              matches_soil_association(
+                SO_ASSOCIA,
+                doa_peat_associations
+              ),
+            Included_in_SFD_peat =
+              matches_soil_association(
+                SO_ASSOCIA,
+                sfd_peat_associations
+              )
+          ) |>
+          dplyr::distinct()
+      },
+      error = function(e) {
+        
+        tibble::tibble(
+          Source = phu_name,
+          SO_ASSOCIA =
+            NA_character_,
+          Included_in_DoA_peat =
+            NA,
+          Included_in_SFD_peat =
+            NA
+        )
+      }
+    )
+  }
+)
+
+sabah_soil_audit <- sabah_peat_original |>
+  sf::st_drop_geometry() |>
+  dplyr::transmute(
+    Source =
+      "Sabah peat shapefile",
+    SO_ASSOCIA =
+      as.character(
+        SO_ASSOCIA
+      ),
+    Included_in_DoA_peat =
+      matches_soil_association(
+        SO_ASSOCIA,
+        doa_peat_associations
+      ),
+    Included_in_SFD_peat =
+      matches_soil_association(
+        SO_ASSOCIA,
+        sfd_peat_associations
+      )
+  ) |>
+  dplyr::distinct()
+
+soil_association_audit <- dplyr::bind_rows(
+  phu_soil_audit,
+  sabah_soil_audit
+) |>
+  dplyr::arrange(
+    Source,
+    SO_ASSOCIA
+  )
+
+
+# ============================================================
+# 34. Output paths
+# ============================================================
+
+long_output_path <- file.path(
+  output_folder,
+  "RSPO_company_area_by_PHU_and_peat_definition_long.csv"
+)
+
+wide_output_path <- file.path(
+  output_folder,
+  "RSPO_company_area_by_PHU_and_peat_definition_wide.csv"
+)
+
+extent_summary_output_path <- file.path(
+  output_folder,
+  "RSPO_extent_summary_and_reconciliation.csv"
+)
+
+company_audit_output_path <- file.path(
+  output_folder,
+  "RSPO_parent_member_category_audit.csv"
+)
+
+soil_audit_output_path <- file.path(
+  output_folder,
+  "SO_ASSOCIA_classification_audit.csv"
+)
+
+processing_errors_output_path <- file.path(
+  output_folder,
+  "RSPO_PHU_processing_errors.csv"
+)
+
+
+# ============================================================
+# 35. Save output files
+# ============================================================
+
+readr::write_csv(
+  company_overlap_results_formatted,
+  long_output_path,
+  na = ""
+)
+
+readr::write_csv(
+  company_overlap_results_wide,
+  wide_output_path,
+  na = ""
+)
+
+readr::write_csv(
+  extent_summary_formatted,
+  extent_summary_output_path,
+  na = ""
+)
+
+readr::write_csv(
+  rspo_company_audit,
+  company_audit_output_path,
+  na = ""
+)
+
+readr::write_csv(
+  soil_association_audit,
+  soil_audit_output_path,
+  na = ""
+)
+
+readr::write_csv(
+  processing_errors,
+  processing_errors_output_path,
+  na = ""
+)
+
+
+# ============================================================
+# 36. Print statewide results
+# ============================================================
+
+cat(
+  "\nStatewide Sabah peat results by company:\n\n"
+)
+
+print(
+  company_overlap_results_formatted |>
+    dplyr::filter(
+      Scope == "Sabah peatland"
+    ),
+  n = Inf
+)
+
+
+# ============================================================
+# 37. Print reconciliation warnings
+#
+# Potential overlap means different company/member-category
+# groups overlap spatially. It does not necessarily indicate
+# an error, but it should be reviewed.
+# ============================================================
+
+overlap_warnings <- extent_summary_formatted |>
+  dplyr::filter(
+    Potential_overlap_between_company_groups_ha >
+      1
+  )
+
+if (nrow(overlap_warnings) > 0) {
+  
+  cat(
+    "\nPotential overlaps between company groups detected:\n\n"
+  )
+  
+  print(
+    overlap_warnings,
+    n = Inf
+  )
+  
+} else {
+  
+  cat(
+    "\nNo company-group overlaps above 1 hectare were detected.\n"
+  )
+}
+
+
+# ============================================================
+# 38. Completion message
+# ============================================================
+
+cat(
+  "\nProcessing complete.\n\n",
+  "Detailed company overlap results:\n",
+  long_output_path,
+  "\n\n",
+  "Wide-format company overlap results:\n",
+  wide_output_path,
+  "\n\n",
+  "Extent summary and reconciliation:\n",
+  extent_summary_output_path,
+  "\n\n",
+  "RSPO company/member-category audit:\n",
+  company_audit_output_path,
+  "\n\n",
+  "SO_ASSOCIA audit:\n",
+  soil_audit_output_path,
+  "\n\n",
+  "Processing errors:\n",
+  processing_errors_output_path,
+  "\n",
+  sep = ""
+)
