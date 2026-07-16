@@ -1,0 +1,2070 @@
+# ============================================================
+# OIL-PALM AREA ON PEAT BY PHU AND STATEWIDE PEAT DEFINITION
+#
+# Oil-palm layer:
+#   C:/Users/User/Documents/Peatland/GIS/Oilpalm/
+#   OilPalm_FTC24.gpkg
+#
+# Oil-palm class:
+#   gridcode = 8
+#
+# Peat definitions:
+#   DoA = Sapi, Klias, Sipitang and Usukan soil associations
+#   SFD = Klias and Sipitang soil associations
+#
+# Results are produced for:
+#   1. Total Sabah peat extent under each definition
+#   2. Each PHU under each peat definition
+#
+# Main outputs:
+#   - peat area
+#   - oil-palm area on peat
+#   - percentage of peat under oil palm
+#   - remaining peat outside mapped oil palm
+#
+# Geometry handling:
+#   - removes missing and empty geometry
+#   - removes Z and M dimensions
+#   - repairs invalid polygons
+#   - extracts polygon components
+#   - uses an equal-area CRS
+#   - retries failed intersections after additional repair
+# ============================================================
+
+
+# ============================================================
+# 1. Required packages
+# ============================================================
+
+required_packages <- c(
+  "sf",
+  "dplyr",
+  "purrr",
+  "stringr",
+  "tidyr",
+  "readr",
+  "tibble"
+)
+
+packages_to_install <- required_packages[
+  !required_packages %in%
+    rownames(installed.packages())
+]
+
+if (length(packages_to_install) > 0) {
+  
+  install.packages(
+    packages_to_install,
+    dependencies = TRUE
+  )
+}
+
+
+# ============================================================
+# 2. Load packages
+# ============================================================
+
+library(sf)
+library(dplyr)
+library(purrr)
+library(stringr)
+library(tidyr)
+library(readr)
+library(tibble)
+
+
+# ============================================================
+# 3. File paths
+# ============================================================
+
+oil_palm_path <- paste0(
+  "C:/Users/User/Documents/Peatland/GIS/",
+  "Oilpalm/Extent/OilPalm_FTC24.gpkg"
+)
+
+phu_folder <- paste0(
+  "C:/Users/User/Documents/Peatland/GIS/",
+  "PHU-extent"
+)
+
+sabah_peat_path <- paste0(
+  "C:/Users/User/Documents/Peatland/GIS/",
+  "PealandSabah.shp"
+)
+
+output_folder <- paste0(
+  "C:/Users/User/Documents/Peatland/GIS/",
+  "OilPalm-peat-results"
+)
+
+
+# ============================================================
+# 4. Create output folder
+# ============================================================
+
+if (!dir.exists(output_folder)) {
+  
+  dir.create(
+    output_folder,
+    recursive = TRUE
+  )
+}
+
+
+# ============================================================
+# 5. Check input files
+# ============================================================
+
+if (!file.exists(oil_palm_path)) {
+  
+  stop(
+    paste(
+      "Oil-palm GeoPackage not found:",
+      oil_palm_path
+    )
+  )
+}
+
+if (!dir.exists(phu_folder)) {
+  
+  stop(
+    paste(
+      "PHU folder not found:",
+      phu_folder
+    )
+  )
+}
+
+if (!file.exists(sabah_peat_path)) {
+  
+  stop(
+    paste(
+      "Sabah peat shapefile not found:",
+      sabah_peat_path
+    )
+  )
+}
+
+phu_files <- list.files(
+  path = phu_folder,
+  pattern = "\\.gpkg$",
+  full.names = TRUE,
+  ignore.case = TRUE
+)
+
+if (length(phu_files) == 0) {
+  
+  stop(
+    paste(
+      "No PHU GeoPackages were found in:",
+      phu_folder
+    )
+  )
+}
+
+
+# ============================================================
+# 6. Analysis settings
+#
+# EPSG:6933 is an equal-area projected CRS.
+# All overlays and area calculations are done in this CRS.
+# ============================================================
+
+analysis_crs <- 6933
+
+oil_palm_gridcode <- 8
+
+doa_peat_associations <- c(
+  "SAPI",
+  "KLIAS",
+  "SIPITANG",
+  "USUKAN"
+)
+
+sfd_peat_associations <- c(
+  "KLIAS",
+  "SIPITANG"
+)
+
+
+# ============================================================
+# 7. Text-cleaning functions
+# ============================================================
+
+clean_text <- function(x) {
+  
+  x |>
+    as.character() |>
+    stringr::str_squish() |>
+    stringr::str_to_upper()
+}
+
+
+normalise_field_name <- function(x) {
+  
+  x |>
+    as.character() |>
+    stringr::str_to_upper() |>
+    stringr::str_replace_all(
+      "[^A-Z0-9]",
+      ""
+    )
+}
+
+
+# ============================================================
+# 8. Find a field using possible names
+# ============================================================
+
+find_field_name <- function(
+    spatial_object,
+    possible_names) {
+  
+  existing_names <- names(
+    spatial_object
+  )
+  
+  existing_normalised <- normalise_field_name(
+    existing_names
+  )
+  
+  possible_normalised <- normalise_field_name(
+    possible_names
+  )
+  
+  matching_position <- which(
+    existing_normalised %in%
+      possible_normalised
+  )
+  
+  if (length(matching_position) == 0) {
+    
+    return(NA_character_)
+  }
+  
+  existing_names[
+    matching_position[1]
+  ]
+}
+
+
+# ============================================================
+# 9. Standardise a field name
+# ============================================================
+
+standardise_field_name <- function(
+    spatial_object,
+    possible_names,
+    new_name) {
+  
+  existing_field <- find_field_name(
+    spatial_object,
+    possible_names
+  )
+  
+  if (is.na(existing_field)) {
+    
+    stop(
+      paste(
+        "Could not find required field.",
+        "Expected one of:",
+        paste(
+          possible_names,
+          collapse = ", "
+        )
+      )
+    )
+  }
+  
+  if (existing_field != new_name) {
+    
+    names(spatial_object)[
+      names(spatial_object) ==
+        existing_field
+    ] <- new_name
+  }
+  
+  spatial_object
+}
+
+
+# ============================================================
+# 10. Match soil-association values
+#
+# Supports values such as:
+#   Klias
+#   Klias Association
+#   KLIAS SOIL ASSOCIATION
+#   Klias / Sipitang
+# ============================================================
+
+matches_soil_association <- function(
+    soil_values,
+    target_associations) {
+  
+  cleaned_values <- clean_text(
+    soil_values
+  )
+  
+  association_pattern <- paste0(
+    "\\b(",
+    paste(
+      target_associations,
+      collapse = "|"
+    ),
+    ")\\b"
+  )
+  
+  !is.na(cleaned_values) &
+    stringr::str_detect(
+      cleaned_values,
+      association_pattern
+    )
+}
+
+
+# ============================================================
+# 11. Repair polygon geometry
+# ============================================================
+
+repair_polygon_geometry <- function(
+    spatial_object,
+    object_name = "spatial object",
+    use_zero_buffer = FALSE,
+    remove_zero_area = FALSE) {
+  
+  if (!inherits(spatial_object, "sf")) {
+    
+    stop(
+      paste(
+        object_name,
+        "is not an sf object."
+      )
+    )
+  }
+  
+  if (is.na(sf::st_crs(spatial_object))) {
+    
+    stop(
+      paste(
+        object_name,
+        "does not have a defined CRS."
+      )
+    )
+  }
+  
+  if (nrow(spatial_object) == 0) {
+    
+    return(spatial_object)
+  }
+  
+  
+  # ----------------------------------------------------------
+  # Remove Z and M dimensions
+  # ----------------------------------------------------------
+  
+  spatial_object <- suppressWarnings(
+    sf::st_zm(
+      spatial_object,
+      drop = TRUE,
+      what = "ZM"
+    )
+  )
+  
+  
+  # ----------------------------------------------------------
+  # Remove missing geometries
+  # ----------------------------------------------------------
+  
+  missing_geometry <- is.na(
+    sf::st_geometry(
+      spatial_object
+    )
+  )
+  
+  spatial_object <- spatial_object[
+    !missing_geometry,
+    ,
+    drop = FALSE
+  ]
+  
+  if (nrow(spatial_object) == 0) {
+    
+    return(spatial_object)
+  }
+  
+  
+  # ----------------------------------------------------------
+  # Remove empty geometries
+  # ----------------------------------------------------------
+  
+  empty_geometry <- tryCatch(
+    sf::st_is_empty(
+      spatial_object
+    ),
+    error = function(e) {
+      
+      rep(
+        FALSE,
+        nrow(spatial_object)
+      )
+    }
+  )
+  
+  spatial_object <- spatial_object[
+    !empty_geometry,
+    ,
+    drop = FALSE
+  ]
+  
+  if (nrow(spatial_object) == 0) {
+    
+    return(spatial_object)
+  }
+  
+  
+  # ----------------------------------------------------------
+  # First validity repair
+  # ----------------------------------------------------------
+  
+  spatial_object <- suppressWarnings(
+    sf::st_make_valid(
+      spatial_object
+    )
+  )
+  
+  
+  # ----------------------------------------------------------
+  # Remove geometry lost during repair
+  # ----------------------------------------------------------
+  
+  spatial_object <- spatial_object[
+    !is.na(
+      sf::st_geometry(
+        spatial_object
+      )
+    ),
+    ,
+    drop = FALSE
+  ]
+  
+  if (nrow(spatial_object) == 0) {
+    
+    return(spatial_object)
+  }
+  
+  spatial_object <- spatial_object[
+    !sf::st_is_empty(
+      spatial_object
+    ),
+    ,
+    drop = FALSE
+  ]
+  
+  if (nrow(spatial_object) == 0) {
+    
+    return(spatial_object)
+  }
+  
+  
+  # ----------------------------------------------------------
+  # Extract polygons from geometry collections
+  # ----------------------------------------------------------
+  
+  geometry_types <- as.character(
+    sf::st_geometry_type(
+      spatial_object
+    )
+  )
+  
+  if (
+    any(
+      geometry_types ==
+      "GEOMETRYCOLLECTION"
+    )
+  ) {
+    
+    spatial_object <- suppressWarnings(
+      sf::st_collection_extract(
+        spatial_object,
+        type = "POLYGON"
+      )
+    )
+  }
+  
+  
+  # ----------------------------------------------------------
+  # Retain polygon geometry only
+  # ----------------------------------------------------------
+  
+  geometry_types <- as.character(
+    sf::st_geometry_type(
+      spatial_object
+    )
+  )
+  
+  polygon_rows <- geometry_types %in%
+    c(
+      "POLYGON",
+      "MULTIPOLYGON"
+    )
+  
+  spatial_object <- spatial_object[
+    polygon_rows,
+    ,
+    drop = FALSE
+  ]
+  
+  if (nrow(spatial_object) == 0) {
+    
+    return(spatial_object)
+  }
+  
+  
+  # ----------------------------------------------------------
+  # Optional zero-distance buffer
+  #
+  # This is only used after transformation to a projected CRS.
+  # ----------------------------------------------------------
+  
+  if (use_zero_buffer) {
+    
+    buffered_object <- tryCatch(
+      suppressWarnings(
+        sf::st_buffer(
+          spatial_object,
+          dist = 0
+        )
+      ),
+      error = function(e) {
+        
+        NULL
+      }
+    )
+    
+    if (!is.null(buffered_object)) {
+      
+      spatial_object <- buffered_object
+    }
+  }
+  
+  
+  # ----------------------------------------------------------
+  # Final validity repair
+  # ----------------------------------------------------------
+  
+  spatial_object <- suppressWarnings(
+    sf::st_make_valid(
+      spatial_object
+    )
+  )
+  
+  spatial_object <- spatial_object[
+    !is.na(
+      sf::st_geometry(
+        spatial_object
+      )
+    ),
+    ,
+    drop = FALSE
+  ]
+  
+  if (nrow(spatial_object) == 0) {
+    
+    return(spatial_object)
+  }
+  
+  spatial_object <- spatial_object[
+    !sf::st_is_empty(
+      spatial_object
+    ),
+    ,
+    drop = FALSE
+  ]
+  
+  if (nrow(spatial_object) == 0) {
+    
+    return(spatial_object)
+  }
+  
+  
+  # ----------------------------------------------------------
+  # Extract polygon components again if required
+  # ----------------------------------------------------------
+  
+  geometry_types <- as.character(
+    sf::st_geometry_type(
+      spatial_object
+    )
+  )
+  
+  if (
+    any(
+      geometry_types ==
+      "GEOMETRYCOLLECTION"
+    )
+  ) {
+    
+    spatial_object <- suppressWarnings(
+      sf::st_collection_extract(
+        spatial_object,
+        type = "POLYGON"
+      )
+    )
+  }
+  
+  geometry_types <- as.character(
+    sf::st_geometry_type(
+      spatial_object
+    )
+  )
+  
+  spatial_object <- spatial_object[
+    geometry_types %in%
+      c(
+        "POLYGON",
+        "MULTIPOLYGON"
+      ),
+    ,
+    drop = FALSE
+  ]
+  
+  if (nrow(spatial_object) == 0) {
+    
+    return(spatial_object)
+  }
+  
+  
+  # ----------------------------------------------------------
+  # Remove zero-area remnants
+  # ----------------------------------------------------------
+  
+  if (remove_zero_area) {
+    
+    polygon_area <- tryCatch(
+      as.numeric(
+        sf::st_area(
+          spatial_object
+        )
+      ),
+      error = function(e) {
+        
+        rep(
+          NA_real_,
+          nrow(spatial_object)
+        )
+      }
+    )
+    
+    keep_rows <- (
+      is.finite(polygon_area) &
+        polygon_area > 0
+    )
+    
+    spatial_object <- spatial_object[
+      keep_rows,
+      ,
+      drop = FALSE
+    ]
+  }
+  
+  spatial_object
+}
+
+
+# ============================================================
+# 12. Prepare a layer in the analysis CRS
+# ============================================================
+
+prepare_layer_for_analysis <- function(
+    spatial_object,
+    object_name) {
+  
+  spatial_object <- repair_polygon_geometry(
+    spatial_object = spatial_object,
+    object_name = paste(
+      object_name,
+      "before transformation"
+    ),
+    use_zero_buffer = FALSE,
+    remove_zero_area = FALSE
+  )
+  
+  if (nrow(spatial_object) == 0) {
+    
+    stop(
+      paste(
+        object_name,
+        "contains no usable polygon geometry."
+      )
+    )
+  }
+  
+  spatial_object <- sf::st_transform(
+    spatial_object,
+    crs = analysis_crs
+  )
+  
+  spatial_object <- repair_polygon_geometry(
+    spatial_object = spatial_object,
+    object_name = paste(
+      object_name,
+      "in analysis CRS"
+    ),
+    use_zero_buffer = TRUE,
+    remove_zero_area = TRUE
+  )
+  
+  if (nrow(spatial_object) == 0) {
+    
+    stop(
+      paste(
+        object_name,
+        "contains no usable polygons after transformation."
+      )
+    )
+  }
+  
+  spatial_object
+}
+
+
+# ============================================================
+# 13. Read the oil-palm polygon layer
+#
+# Searches all GeoPackage layers for a polygon layer containing
+# gridcode.
+# ============================================================
+
+read_oil_palm_gpkg <- function(gpkg_path) {
+  
+  layer_names <- sf::st_layers(
+    gpkg_path
+  )$name
+  
+  if (length(layer_names) == 0) {
+    
+    stop(
+      paste(
+        "No layers were found in:",
+        gpkg_path
+      )
+    )
+  }
+  
+  for (layer_name in layer_names) {
+    
+    layer_object <- tryCatch(
+      sf::st_read(
+        dsn = gpkg_path,
+        layer = layer_name,
+        quiet = TRUE,
+        stringsAsFactors = FALSE
+      ),
+      error = function(e) {
+        
+        NULL
+      }
+    )
+    
+    if (
+      is.null(layer_object) ||
+      !inherits(layer_object, "sf") ||
+      nrow(layer_object) == 0
+    ) {
+      
+      next
+    }
+    
+    gridcode_field <- find_field_name(
+      layer_object,
+      c(
+        "gridcode",
+        "grid_code",
+        "grid code"
+      )
+    )
+    
+    if (is.na(gridcode_field)) {
+      
+      next
+    }
+    
+    geometry_types <- unique(
+      as.character(
+        sf::st_geometry_type(
+          layer_object
+        )
+      )
+    )
+    
+    acceptable_types <- c(
+      "POLYGON",
+      "MULTIPOLYGON",
+      "GEOMETRYCOLLECTION"
+    )
+    
+    if (
+      any(
+        geometry_types %in%
+        acceptable_types
+      )
+    ) {
+      
+      message(
+        "Oil-palm layer selected: ",
+        layer_name
+      )
+      
+      layer_object <- standardise_field_name(
+        spatial_object = layer_object,
+        possible_names = c(
+          "gridcode",
+          "grid_code",
+          "grid code"
+        ),
+        new_name = "gridcode"
+      )
+      
+      return(layer_object)
+    }
+  }
+  
+  stop(
+    paste(
+      "No polygon layer containing gridcode",
+      "was found in:",
+      gpkg_path
+    )
+  )
+}
+
+
+# ============================================================
+# 14. Read a PHU GeoPackage
+#
+# Searches all layers for a polygon layer containing SO_ASSOCIA.
+# ============================================================
+
+read_phu_gpkg <- function(gpkg_file) {
+  
+  layer_names <- sf::st_layers(
+    gpkg_file
+  )$name
+  
+  if (length(layer_names) == 0) {
+    
+    stop(
+      paste(
+        "No layers were found in:",
+        basename(gpkg_file)
+      )
+    )
+  }
+  
+  for (layer_name in layer_names) {
+    
+    layer_object <- tryCatch(
+      sf::st_read(
+        dsn = gpkg_file,
+        layer = layer_name,
+        quiet = TRUE,
+        stringsAsFactors = FALSE
+      ),
+      error = function(e) {
+        
+        NULL
+      }
+    )
+    
+    if (
+      is.null(layer_object) ||
+      !inherits(layer_object, "sf") ||
+      nrow(layer_object) == 0
+    ) {
+      
+      next
+    }
+    
+    soil_field <- find_field_name(
+      layer_object,
+      "SO_ASSOCIA"
+    )
+    
+    if (is.na(soil_field)) {
+      
+      next
+    }
+    
+    geometry_types <- unique(
+      as.character(
+        sf::st_geometry_type(
+          layer_object
+        )
+      )
+    )
+    
+    acceptable_types <- c(
+      "POLYGON",
+      "MULTIPOLYGON",
+      "GEOMETRYCOLLECTION"
+    )
+    
+    if (
+      any(
+        geometry_types %in%
+        acceptable_types
+      )
+    ) {
+      
+      layer_object <- standardise_field_name(
+        spatial_object = layer_object,
+        possible_names = "SO_ASSOCIA",
+        new_name = "SO_ASSOCIA"
+      )
+      
+      return(layer_object)
+    }
+  }
+  
+  stop(
+    paste(
+      "No polygon layer containing SO_ASSOCIA",
+      "was found in:",
+      basename(gpkg_file)
+    )
+  )
+}
+
+
+# ============================================================
+# 15. Prepare and dissolve a peat extent
+# ============================================================
+
+prepare_peat_extent <- function(
+    spatial_data,
+    soil_associations,
+    extent_name) {
+  
+  selected_rows <- matches_soil_association(
+    soil_values =
+      spatial_data$SO_ASSOCIA,
+    target_associations =
+      soil_associations
+  )
+  
+  extent_data <- spatial_data[
+    selected_rows,
+    ,
+    drop = FALSE
+  ]
+  
+  if (nrow(extent_data) == 0) {
+    
+    return(NULL)
+  }
+  
+  extent_data <- repair_polygon_geometry(
+    spatial_object = extent_data,
+    object_name = extent_name,
+    use_zero_buffer = TRUE,
+    remove_zero_area = TRUE
+  )
+  
+  if (nrow(extent_data) == 0) {
+    
+    return(NULL)
+  }
+  
+  dissolved_geometry <- suppressWarnings(
+    sf::st_union(
+      sf::st_geometry(
+        extent_data
+      )
+    )
+  )
+  
+  dissolved_extent <- sf::st_sf(
+    extent_id = 1,
+    geom = dissolved_geometry
+  )
+  
+  sf::st_crs(dissolved_extent) <-
+    sf::st_crs(extent_data)
+  
+  dissolved_extent <- repair_polygon_geometry(
+    spatial_object = dissolved_extent,
+    object_name = paste(
+      extent_name,
+      "dissolved"
+    ),
+    use_zero_buffer = TRUE,
+    remove_zero_area = TRUE
+  )
+  
+  dissolved_extent
+}
+
+
+# ============================================================
+# 16. Calculate area in hectares
+# ============================================================
+
+calculate_area_ha <- function(spatial_object) {
+  
+  if (
+    is.null(spatial_object) ||
+    nrow(spatial_object) == 0
+  ) {
+    
+    return(0)
+  }
+  
+  sum(
+    as.numeric(
+      sf::st_area(
+        spatial_object
+      )
+    ),
+    na.rm = TRUE
+  ) / 10000
+}
+
+
+# ============================================================
+# 17. Safely intersect two polygon extents
+# ============================================================
+
+safe_polygon_intersection <- function(
+    first_object,
+    second_object,
+    intersection_name) {
+  
+  intersection_geometry <- tryCatch(
+    suppressWarnings(
+      sf::st_intersection(
+        sf::st_geometry(
+          first_object
+        ),
+        sf::st_geometry(
+          second_object
+        )
+      )
+    ),
+    error = function(e) {
+      
+      NULL
+    }
+  )
+  
+  if (
+    !is.null(intersection_geometry) &&
+    length(intersection_geometry) > 0
+  ) {
+    
+    intersection_object <- sf::st_sf(
+      geom = intersection_geometry
+    )
+    
+    sf::st_crs(intersection_object) <-
+      sf::st_crs(first_object)
+    
+    intersection_object <- tryCatch(
+      repair_polygon_geometry(
+        spatial_object = intersection_object,
+        object_name = intersection_name,
+        use_zero_buffer = TRUE,
+        remove_zero_area = TRUE
+      ),
+      error = function(e) {
+        
+        NULL
+      }
+    )
+    
+    if (
+      !is.null(intersection_object) &&
+      nrow(intersection_object) > 0
+    ) {
+      
+      return(intersection_object)
+    }
+  }
+  
+  
+  # ----------------------------------------------------------
+  # Second attempt after repairing both source objects
+  # ----------------------------------------------------------
+  
+  first_repaired <- tryCatch(
+    repair_polygon_geometry(
+      spatial_object = first_object,
+      object_name = paste(
+        intersection_name,
+        "first input retry"
+      ),
+      use_zero_buffer = TRUE,
+      remove_zero_area = TRUE
+    ),
+    error = function(e) {
+      
+      NULL
+    }
+  )
+  
+  second_repaired <- tryCatch(
+    repair_polygon_geometry(
+      spatial_object = second_object,
+      object_name = paste(
+        intersection_name,
+        "second input retry"
+      ),
+      use_zero_buffer = TRUE,
+      remove_zero_area = TRUE
+    ),
+    error = function(e) {
+      
+      NULL
+    }
+  )
+  
+  if (
+    is.null(first_repaired) ||
+    is.null(second_repaired) ||
+    nrow(first_repaired) == 0 ||
+    nrow(second_repaired) == 0
+  ) {
+    
+    return(NULL)
+  }
+  
+  intersection_geometry <- tryCatch(
+    suppressWarnings(
+      sf::st_intersection(
+        sf::st_geometry(
+          first_repaired
+        ),
+        sf::st_geometry(
+          second_repaired
+        )
+      )
+    ),
+    error = function(e) {
+      
+      NULL
+    }
+  )
+  
+  if (
+    is.null(intersection_geometry) ||
+    length(intersection_geometry) == 0
+  ) {
+    
+    return(NULL)
+  }
+  
+  intersection_object <- sf::st_sf(
+    geom = intersection_geometry
+  )
+  
+  sf::st_crs(intersection_object) <-
+    sf::st_crs(first_repaired)
+  
+  intersection_object <- tryCatch(
+    repair_polygon_geometry(
+      spatial_object = intersection_object,
+      object_name = paste(
+        intersection_name,
+        "retry result"
+      ),
+      use_zero_buffer = TRUE,
+      remove_zero_area = TRUE
+    ),
+    error = function(e) {
+      
+      NULL
+    }
+  )
+  
+  intersection_object
+}
+
+
+# ============================================================
+# 18. Read and prepare oil-palm layer
+# ============================================================
+
+message(
+  "Reading oil-palm layer..."
+)
+
+oil_palm_original <- read_oil_palm_gpkg(
+  oil_palm_path
+)
+
+
+# ============================================================
+# 19. Create gridcode audit before filtering
+# ============================================================
+
+gridcode_audit <- oil_palm_original |>
+  sf::st_drop_geometry() |>
+  dplyr::mutate(
+    gridcode_text =
+      stringr::str_squish(
+        as.character(
+          gridcode
+        )
+      )
+  ) |>
+  dplyr::count(
+    gridcode_text,
+    name = "Feature_count"
+  ) |>
+  dplyr::arrange(
+    gridcode_text
+  )
+
+
+# ============================================================
+# 20. Select gridcode 8
+# ============================================================
+
+gridcode_numeric <- suppressWarnings(
+  as.numeric(
+    as.character(
+      oil_palm_original$gridcode
+    )
+  )
+)
+
+gridcode_text <- stringr::str_squish(
+  as.character(
+    oil_palm_original$gridcode
+  )
+)
+
+oil_palm_rows <- (
+  gridcode_numeric ==
+    oil_palm_gridcode
+) | (
+  gridcode_text ==
+    as.character(
+      oil_palm_gridcode
+    )
+)
+
+oil_palm_rows[
+  is.na(oil_palm_rows)
+] <- FALSE
+
+oil_palm_selected <- oil_palm_original[
+  oil_palm_rows,
+  ,
+  drop = FALSE
+]
+
+if (nrow(oil_palm_selected) == 0) {
+  
+  stop(
+    paste(
+      "No oil-palm polygons were found where",
+      "gridcode equals",
+      oil_palm_gridcode
+    )
+  )
+}
+
+cat(
+  "\nTotal oil-palm layer features:",
+  nrow(oil_palm_original),
+  "\n"
+)
+
+cat(
+  "Features with gridcode 8:",
+  nrow(oil_palm_selected),
+  "\n\n"
+)
+
+
+# ============================================================
+# 21. Repair and transform selected oil-palm polygons
+# ============================================================
+
+message(
+  "Repairing oil-palm geometries..."
+)
+
+oil_palm_work <- prepare_layer_for_analysis(
+  spatial_object = oil_palm_selected,
+  object_name =
+    "Oil-palm gridcode 8 polygons"
+)
+
+
+# ============================================================
+# 22. Dissolve oil-palm polygons
+#
+# This ensures overlapping oil-palm polygons are not counted
+# more than once.
+# ============================================================
+
+message(
+  "Dissolving oil-palm polygons..."
+)
+
+oil_palm_union_geometry <- tryCatch(
+  suppressWarnings(
+    sf::st_union(
+      sf::st_geometry(
+        oil_palm_work
+      )
+    )
+  ),
+  error = function(e) {
+    
+    NULL
+  }
+)
+
+if (is.null(oil_palm_union_geometry)) {
+  
+  stop(
+    paste(
+      "The oil-palm polygons could not be dissolved.",
+      "Check the geometry of OilPalm_FTC24.gpkg."
+    )
+  )
+}
+
+oil_palm_footprint <- sf::st_sf(
+  gridcode = oil_palm_gridcode,
+  geom = oil_palm_union_geometry
+)
+
+sf::st_crs(oil_palm_footprint) <-
+  sf::st_crs(oil_palm_work)
+
+oil_palm_footprint <- repair_polygon_geometry(
+  spatial_object = oil_palm_footprint,
+  object_name =
+    "Dissolved oil-palm footprint",
+  use_zero_buffer = TRUE,
+  remove_zero_area = TRUE
+)
+
+if (nrow(oil_palm_footprint) == 0) {
+  
+  stop(
+    paste(
+      "No usable oil-palm geometry remained",
+      "after dissolving and repairing gridcode 8."
+    )
+  )
+}
+
+total_oil_palm_area_ha <- calculate_area_ha(
+  oil_palm_footprint
+)
+
+cat(
+  "Total dissolved oil-palm area:",
+  round(
+    total_oil_palm_area_ha,
+    1
+  ),
+  "ha\n\n"
+)
+
+
+# ============================================================
+# 23. Summarise oil palm on one peat extent
+# ============================================================
+
+summarise_oil_palm_on_peat <- function(
+    peat_extent,
+    scope_name,
+    area_name,
+    peat_definition) {
+  
+  if (
+    is.null(peat_extent) ||
+    nrow(peat_extent) == 0
+  ) {
+    
+    return(
+      tibble::tibble(
+        Scope = scope_name,
+        Area_name = area_name,
+        Peat_definition = peat_definition,
+        Peat_area_ha = 0,
+        Oil_palm_on_peat_ha = 0,
+        Peat_not_mapped_as_oil_palm_ha = 0,
+        Peat_under_oil_palm_pct = NA_real_,
+        Status = "No matching peat extent"
+      )
+    )
+  }
+  
+  peat_extent <- repair_polygon_geometry(
+    spatial_object = peat_extent,
+    object_name = paste(
+      area_name,
+      peat_definition
+    ),
+    use_zero_buffer = TRUE,
+    remove_zero_area = TRUE
+  )
+  
+  peat_area_ha <- calculate_area_ha(
+    peat_extent
+  )
+  
+  intersection_exists <- tryCatch(
+    lengths(
+      sf::st_intersects(
+        peat_extent,
+        oil_palm_footprint
+      )
+    ) > 0,
+    error = function(e) {
+      
+      FALSE
+    }
+  )
+  
+  if (!any(intersection_exists)) {
+    
+    return(
+      tibble::tibble(
+        Scope = scope_name,
+        Area_name = area_name,
+        Peat_definition = peat_definition,
+        Peat_area_ha = peat_area_ha,
+        Oil_palm_on_peat_ha = 0,
+        Peat_not_mapped_as_oil_palm_ha =
+          peat_area_ha,
+        Peat_under_oil_palm_pct = 0,
+        Status = "No oil-palm overlap"
+      )
+    )
+  }
+  
+  peat_oil_palm_intersection <-
+    safe_polygon_intersection(
+      first_object = peat_extent,
+      second_object = oil_palm_footprint,
+      intersection_name = paste(
+        area_name,
+        peat_definition,
+        "oil-palm overlap"
+      )
+    )
+  
+  if (
+    is.null(peat_oil_palm_intersection) ||
+    nrow(peat_oil_palm_intersection) == 0
+  ) {
+    
+    return(
+      tibble::tibble(
+        Scope = scope_name,
+        Area_name = area_name,
+        Peat_definition = peat_definition,
+        Peat_area_ha = peat_area_ha,
+        Oil_palm_on_peat_ha = NA_real_,
+        Peat_not_mapped_as_oil_palm_ha =
+          NA_real_,
+        Peat_under_oil_palm_pct =
+          NA_real_,
+        Status =
+          "Intersection failed after geometry repair"
+      )
+    )
+  }
+  
+  oil_palm_on_peat_ha <- calculate_area_ha(
+    peat_oil_palm_intersection
+  )
+  
+  # Prevent very small numerical errors from creating
+  # negative remaining areas.
+  peat_not_oil_palm_ha <- max(
+    peat_area_ha -
+      oil_palm_on_peat_ha,
+    0
+  )
+  
+  peat_under_oil_palm_pct <- if (
+    peat_area_ha > 0
+  ) {
+    
+    oil_palm_on_peat_ha /
+      peat_area_ha *
+      100
+    
+  } else {
+    
+    NA_real_
+  }
+  
+  tibble::tibble(
+    Scope = scope_name,
+    Area_name = area_name,
+    Peat_definition = peat_definition,
+    Peat_area_ha = peat_area_ha,
+    Oil_palm_on_peat_ha =
+      oil_palm_on_peat_ha,
+    Peat_not_mapped_as_oil_palm_ha =
+      peat_not_oil_palm_ha,
+    Peat_under_oil_palm_pct =
+      peat_under_oil_palm_pct,
+    Status = "Completed"
+  )
+}
+
+
+# ============================================================
+# 24. Process one PHU
+# ============================================================
+
+process_phu_file <- function(gpkg_file) {
+  
+  phu_name <- tools::file_path_sans_ext(
+    basename(gpkg_file)
+  )
+  
+  message(
+    "Processing PHU: ",
+    phu_name
+  )
+  
+  tryCatch(
+    {
+      
+      phu_original <- read_phu_gpkg(
+        gpkg_file
+      )
+      
+      phu_work <- prepare_layer_for_analysis(
+        spatial_object = phu_original,
+        object_name = phu_name
+      )
+      
+      phu_doa_peat <- prepare_peat_extent(
+        spatial_data = phu_work,
+        soil_associations =
+          doa_peat_associations,
+        extent_name = paste(
+          phu_name,
+          "DoA peat"
+        )
+      )
+      
+      phu_sfd_peat <- prepare_peat_extent(
+        spatial_data = phu_work,
+        soil_associations =
+          sfd_peat_associations,
+        extent_name = paste(
+          phu_name,
+          "SFD peat"
+        )
+      )
+      
+      dplyr::bind_rows(
+        
+        summarise_oil_palm_on_peat(
+          peat_extent = phu_doa_peat,
+          scope_name = "PHU",
+          area_name = phu_name,
+          peat_definition =
+            "DoA peat extent"
+        ),
+        
+        summarise_oil_palm_on_peat(
+          peat_extent = phu_sfd_peat,
+          scope_name = "PHU",
+          area_name = phu_name,
+          peat_definition =
+            "SFD peat extent"
+        )
+      )
+    },
+    error = function(e) {
+      
+      tibble::tibble(
+        Scope = "PHU",
+        Area_name = phu_name,
+        Peat_definition =
+          "Processing error",
+        Peat_area_ha = NA_real_,
+        Oil_palm_on_peat_ha =
+          NA_real_,
+        Peat_not_mapped_as_oil_palm_ha =
+          NA_real_,
+        Peat_under_oil_palm_pct =
+          NA_real_,
+        Status = conditionMessage(e)
+      )
+    }
+  )
+}
+
+
+# ============================================================
+# 25. Process all PHUs
+# ============================================================
+
+phu_results <- purrr::map_dfr(
+  phu_files,
+  process_phu_file
+)
+
+
+# ============================================================
+# 26. Read statewide Sabah peat layer
+# ============================================================
+
+message(
+  "Reading statewide Sabah peat layer..."
+)
+
+sabah_peat_original <- sf::st_read(
+  sabah_peat_path,
+  quiet = TRUE,
+  stringsAsFactors = FALSE
+)
+
+sabah_peat_original <- standardise_field_name(
+  spatial_object = sabah_peat_original,
+  possible_names = "SO_ASSOCIA",
+  new_name = "SO_ASSOCIA"
+)
+
+sabah_peat_work <- prepare_layer_for_analysis(
+  spatial_object = sabah_peat_original,
+  object_name =
+    "Statewide Sabah peat layer"
+)
+
+
+# ============================================================
+# 27. Prepare statewide peat definitions
+# ============================================================
+
+sabah_doa_peat <- prepare_peat_extent(
+  spatial_data = sabah_peat_work,
+  soil_associations =
+    doa_peat_associations,
+  extent_name =
+    "Total Sabah DoA peat"
+)
+
+sabah_sfd_peat <- prepare_peat_extent(
+  spatial_data = sabah_peat_work,
+  soil_associations =
+    sfd_peat_associations,
+  extent_name =
+    "Total Sabah SFD peat"
+)
+
+
+# ============================================================
+# 28. Calculate statewide results
+# ============================================================
+
+message(
+  "Calculating statewide peat and oil-palm overlap..."
+)
+
+sabah_results <- dplyr::bind_rows(
+  
+  summarise_oil_palm_on_peat(
+    peat_extent = sabah_doa_peat,
+    scope_name = "Sabah",
+    area_name = "Sabah",
+    peat_definition =
+      "Total Sabah DoA peat extent"
+  ),
+  
+  summarise_oil_palm_on_peat(
+    peat_extent = sabah_sfd_peat,
+    scope_name = "Sabah",
+    area_name = "Sabah",
+    peat_definition =
+      "Total Sabah SFD peat extent"
+  )
+)
+
+
+# ============================================================
+# 29. Combine statewide and PHU results
+# ============================================================
+
+all_results <- dplyr::bind_rows(
+  sabah_results,
+  phu_results
+)
+
+
+# ============================================================
+# 30. Format long-format results
+# ============================================================
+
+results_formatted <- all_results |>
+  dplyr::mutate(
+    Peat_area_ha = round(
+      Peat_area_ha,
+      2
+    ),
+    Oil_palm_on_peat_ha = round(
+      Oil_palm_on_peat_ha,
+      2
+    ),
+    Peat_not_mapped_as_oil_palm_ha =
+      round(
+        Peat_not_mapped_as_oil_palm_ha,
+        2
+      ),
+    Peat_under_oil_palm_pct =
+      round(
+        Peat_under_oil_palm_pct,
+        2
+      )
+  ) |>
+  dplyr::arrange(
+    Scope,
+    Area_name,
+    Peat_definition
+  )
+
+
+# ============================================================
+# 31. Create wide-format results
+# ============================================================
+
+results_wide <- results_formatted |>
+  dplyr::filter(
+    Peat_definition !=
+      "Processing error"
+  ) |>
+  dplyr::select(
+    Scope,
+    Area_name,
+    Peat_definition,
+    Peat_area_ha,
+    Oil_palm_on_peat_ha,
+    Peat_not_mapped_as_oil_palm_ha,
+    Peat_under_oil_palm_pct
+  ) |>
+  tidyr::pivot_wider(
+    names_from =
+      Peat_definition,
+    values_from = c(
+      Peat_area_ha,
+      Oil_palm_on_peat_ha,
+      Peat_not_mapped_as_oil_palm_ha,
+      Peat_under_oil_palm_pct
+    ),
+    names_glue =
+      "{.value}_{Peat_definition}"
+  ) |>
+  dplyr::rename_with(
+    function(column_name) {
+      
+      column_name |>
+        stringr::str_replace_all(
+          "[^A-Za-z0-9]+",
+          "_"
+        ) |>
+        stringr::str_replace_all(
+          "^_+|_+$",
+          ""
+        )
+    }
+  )
+
+
+# ============================================================
+# 32. Create SO_ASSOCIA classification audit
+# ============================================================
+
+phu_soil_audit <- purrr::map_dfr(
+  phu_files,
+  function(gpkg_file) {
+    
+    phu_name <- tools::file_path_sans_ext(
+      basename(gpkg_file)
+    )
+    
+    tryCatch(
+      {
+        
+        phu_data <- read_phu_gpkg(
+          gpkg_file
+        )
+        
+        phu_data |>
+          sf::st_drop_geometry() |>
+          dplyr::transmute(
+            Source = phu_name,
+            SO_ASSOCIA =
+              as.character(
+                SO_ASSOCIA
+              ),
+            Included_in_DoA_peat =
+              matches_soil_association(
+                SO_ASSOCIA,
+                doa_peat_associations
+              ),
+            Included_in_SFD_peat =
+              matches_soil_association(
+                SO_ASSOCIA,
+                sfd_peat_associations
+              )
+          ) |>
+          dplyr::distinct()
+      },
+      error = function(e) {
+        
+        tibble::tibble(
+          Source = phu_name,
+          SO_ASSOCIA =
+            NA_character_,
+          Included_in_DoA_peat =
+            NA,
+          Included_in_SFD_peat =
+            NA
+        )
+      }
+    )
+  }
+)
+
+sabah_soil_audit <- sabah_peat_original |>
+  sf::st_drop_geometry() |>
+  dplyr::transmute(
+    Source =
+      "Sabah peat shapefile",
+    SO_ASSOCIA =
+      as.character(
+        SO_ASSOCIA
+      ),
+    Included_in_DoA_peat =
+      matches_soil_association(
+        SO_ASSOCIA,
+        doa_peat_associations
+      ),
+    Included_in_SFD_peat =
+      matches_soil_association(
+        SO_ASSOCIA,
+        sfd_peat_associations
+      )
+  ) |>
+  dplyr::distinct()
+
+soil_association_audit <- dplyr::bind_rows(
+  phu_soil_audit,
+  sabah_soil_audit
+) |>
+  dplyr::arrange(
+    Source,
+    SO_ASSOCIA
+  )
+
+
+# ============================================================
+# 33. Create processing-error table
+# ============================================================
+
+processing_errors <- results_formatted |>
+  dplyr::filter(
+    Peat_definition ==
+      "Processing error" |
+      stringr::str_detect(
+        Status,
+        regex(
+          "failed|error",
+          ignore_case = TRUE
+        )
+      )
+  )
+
+
+# ============================================================
+# 34. Create a simple reconciliation check
+# ============================================================
+
+area_reconciliation <- results_formatted |>
+  dplyr::filter(
+    !is.na(Peat_area_ha),
+    !is.na(Oil_palm_on_peat_ha),
+    !is.na(
+      Peat_not_mapped_as_oil_palm_ha
+    )
+  ) |>
+  dplyr::mutate(
+    Reconstructed_peat_area_ha =
+      Oil_palm_on_peat_ha +
+      Peat_not_mapped_as_oil_palm_ha,
+    Difference_ha =
+      Reconstructed_peat_area_ha -
+      Peat_area_ha,
+    Reconciliation_status =
+      dplyr::case_when(
+        abs(Difference_ha) <= 1 ~
+          "OK",
+        TRUE ~
+          "Check"
+      )
+  ) |>
+  dplyr::select(
+    Scope,
+    Area_name,
+    Peat_definition,
+    Peat_area_ha,
+    Oil_palm_on_peat_ha,
+    Peat_not_mapped_as_oil_palm_ha,
+    Reconstructed_peat_area_ha,
+    Difference_ha,
+    Reconciliation_status
+  )
+
+
+# ============================================================
+# 35. Output paths
+# ============================================================
+
+long_output_path <- file.path(
+  output_folder,
+  "OilPalm_area_and_percentage_of_peat_by_PHU_and_Sabah_long.csv"
+)
+
+wide_output_path <- file.path(
+  output_folder,
+  "OilPalm_area_and_percentage_of_peat_by_PHU_and_Sabah_wide.csv"
+)
+
+gridcode_audit_output_path <- file.path(
+  output_folder,
+  "OilPalm_gridcode_audit.csv"
+)
+
+soil_audit_output_path <- file.path(
+  output_folder,
+  "SO_ASSOCIA_classification_audit.csv"
+)
+
+processing_errors_output_path <- file.path(
+  output_folder,
+  "OilPalm_peat_processing_errors.csv"
+)
+
+reconciliation_output_path <- file.path(
+  output_folder,
+  "OilPalm_peat_area_reconciliation_check.csv"
+)
+
+
+# ============================================================
+# 36. Save outputs
+# ============================================================
+
+readr::write_csv(
+  results_formatted,
+  long_output_path,
+  na = ""
+)
+
+readr::write_csv(
+  results_wide,
+  wide_output_path,
+  na = ""
+)
+
+readr::write_csv(
+  gridcode_audit,
+  gridcode_audit_output_path,
+  na = ""
+)
+
+readr::write_csv(
+  soil_association_audit,
+  soil_audit_output_path,
+  na = ""
+)
+
+readr::write_csv(
+  processing_errors,
+  processing_errors_output_path,
+  na = ""
+)
+
+readr::write_csv(
+  area_reconciliation,
+  reconciliation_output_path,
+  na = ""
+)
+
+
+# ============================================================
+# 37. Print statewide results
+# ============================================================
+
+cat(
+  "\nStatewide Sabah results:\n\n"
+)
+
+print(
+  results_formatted |>
+    dplyr::filter(
+      Scope == "Sabah"
+    ),
+  n = Inf
+)
+
+
+# ============================================================
+# 38. Print PHU results
+# ============================================================
+
+cat(
+  "\nPHU results:\n\n"
+)
+
+print(
+  results_formatted |>
+    dplyr::filter(
+      Scope == "PHU"
+    ),
+  n = Inf
+)
+
+
+# ============================================================
+# 39. Completion message
+# ============================================================
+
+cat(
+  "\nProcessing complete.\n\n",
+  "Detailed long-format results:\n",
+  long_output_path,
+  "\n\n",
+  "Wide-format results:\n",
+  wide_output_path,
+  "\n\n",
+  "Oil-palm gridcode audit:\n",
+  gridcode_audit_output_path,
+  "\n\n",
+  "SO_ASSOCIA classification audit:\n",
+  soil_audit_output_path,
+  "\n\n",
+  "Processing errors:\n",
+  processing_errors_output_path,
+  "\n\n",
+  "Area reconciliation check:\n",
+  reconciliation_output_path,
+  "\n",
+  sep = ""
+)
