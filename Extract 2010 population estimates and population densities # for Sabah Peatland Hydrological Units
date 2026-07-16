@@ -1,0 +1,1178 @@
+# ============================================================
+# Extract 2010 population estimates and population densities
+# for Sabah Peatland Hydrological Units
+#
+# Summaries produced for each PHU:
+#   1. Total PHU
+#   2. DoA peat extent:
+#      Sapi, Klias, Sipitang and Usukan soil associations
+#   3. SFD peat extent:
+#      Klias and Sipitang soil associations
+#
+# Population calculation assumes that each raster cell contains
+# an estimated population count for that cell.
+#
+# NoData values such as -3.402823e+38 are converted to NA.
+# ============================================================
+
+
+# ============================================================
+# 1. Required packages
+# ============================================================
+
+required_packages <- c(
+  "sf",
+  "terra",
+  "exactextractr",
+  "dplyr",
+  "purrr",
+  "stringr",
+  "readr",
+  "tibble",
+  "tidyr"
+)
+
+packages_to_install <- required_packages[
+  !required_packages %in%
+    rownames(installed.packages())
+]
+
+if (length(packages_to_install) > 0) {
+  install.packages(
+    packages_to_install,
+    dependencies = TRUE
+  )
+}
+
+
+# ============================================================
+# 2. Load packages
+# ============================================================
+
+library(sf)
+library(terra)
+library(exactextractr)
+library(dplyr)
+library(purrr)
+library(stringr)
+library(readr)
+library(tibble)
+library(tidyr)
+
+
+# ============================================================
+# 3. File paths
+# ============================================================
+
+population_raster_path <- paste0(
+  "C:/Users/User/Documents/Peatland/GIS/",
+  "Sabah population2010.tif"
+)
+
+phu_folder <- paste0(
+  "C:/Users/User/Documents/Peatland/GIS/",
+  "PHU-extent"
+)
+
+output_folder <- paste0(
+  "C:/Users/User/Documents/Peatland/GIS/",
+  "PHU-population-results"
+)
+
+
+# ============================================================
+# 4. Create output folder
+# ============================================================
+
+if (!dir.exists(output_folder)) {
+  dir.create(
+    output_folder,
+    recursive = TRUE
+  )
+}
+
+
+# ============================================================
+# 5. Check input files and folders
+# ============================================================
+
+if (!file.exists(population_raster_path)) {
+  stop(
+    paste(
+      "Population raster not found:",
+      population_raster_path
+    )
+  )
+}
+
+if (!dir.exists(phu_folder)) {
+  stop(
+    paste(
+      "PHU folder not found:",
+      phu_folder
+    )
+  )
+}
+
+phu_files <- list.files(
+  path = phu_folder,
+  pattern = "\\.gpkg$",
+  full.names = TRUE,
+  ignore.case = TRUE
+)
+
+if (length(phu_files) == 0) {
+  stop(
+    paste(
+      "No GeoPackage files were found in:",
+      phu_folder
+    )
+  )
+}
+
+
+# ============================================================
+# 6. Load population raster
+# ============================================================
+
+population_raster <- terra::rast(
+  population_raster_path
+)
+
+if (terra::nlyr(population_raster) > 1) {
+  
+  warning(
+    paste(
+      "The population raster contains",
+      terra::nlyr(population_raster),
+      "layers. Only the first layer will be used."
+    )
+  )
+  
+  population_raster <-
+    population_raster[[1]]
+}
+
+if (
+  is.na(terra::crs(population_raster)) ||
+  terra::crs(population_raster) == ""
+) {
+  stop(
+    "The population raster does not have a valid CRS."
+  )
+}
+
+
+# ============================================================
+# 7. Clean population raster NoData values
+#
+# The raster contains a NoData sentinel near:
+#   -3.402823e+38
+#
+# The threshold below safely converts these extremely negative
+# values to NA.
+# ============================================================
+
+population_raster <- terra::ifel(
+  population_raster < -1e20,
+  NA,
+  population_raster
+)
+
+# Population values should not be negative.
+# Convert any remaining negative values to NA.
+population_raster <- terra::ifel(
+  population_raster < 0,
+  NA,
+  population_raster
+)
+
+names(population_raster) <- "population"
+
+
+# ============================================================
+# 8. Check cleaned raster values
+# ============================================================
+
+population_raster_summary <- terra::global(
+  population_raster,
+  fun = c(
+    "min",
+    "max",
+    "mean",
+    "sum"
+  ),
+  na.rm = TRUE
+)
+
+cat(
+  "\nCleaned population raster summary:\n"
+)
+
+print(
+  population_raster_summary
+)
+
+if (
+  is.finite(
+    population_raster_summary$min[1]
+  ) &&
+  population_raster_summary$min[1] < 0
+) {
+  stop(
+    paste(
+      "Negative raster values remain after cleaning.",
+      "Check the population raster."
+    )
+  )
+}
+
+
+# ============================================================
+# 9. Peat soil-association definitions
+# ============================================================
+
+doa_peat_associations <- c(
+  "SAPI",
+  "KLIAS",
+  "SIPITANG",
+  "USUKAN"
+)
+
+sfd_peat_associations <- c(
+  "KLIAS",
+  "SIPITANG"
+)
+
+
+# ============================================================
+# 10. Clean soil-association text
+# ============================================================
+
+clean_soil_association <- function(x) {
+  
+  x |>
+    as.character() |>
+    stringr::str_squish() |>
+    stringr::str_to_upper()
+}
+
+
+# ============================================================
+# 11. Match soil associations
+#
+# This supports values such as:
+#   Klias
+#   Klias Association
+#   KLIAS SOIL ASSOCIATION
+#   Klias / Sipitang
+# ============================================================
+
+matches_soil_association <- function(
+    soil_values,
+    target_associations) {
+  
+  cleaned_values <- clean_soil_association(
+    soil_values
+  )
+  
+  target_pattern <- paste0(
+    "\\b(",
+    paste(
+      target_associations,
+      collapse = "|"
+    ),
+    ")\\b"
+  )
+  
+  !is.na(cleaned_values) &
+    stringr::str_detect(
+      cleaned_values,
+      target_pattern
+    )
+}
+
+
+# ============================================================
+# 12. Read the polygon layer from a GeoPackage
+#
+# This searches all layers and returns the first polygon layer
+# containing the SO_ASSOCIA field.
+# ============================================================
+
+read_phu_gpkg <- function(gpkg_file) {
+  
+  layer_information <- sf::st_layers(
+    gpkg_file
+  )
+  
+  available_layers <- layer_information$name
+  
+  if (length(available_layers) == 0) {
+    stop(
+      paste(
+        "No layers found in:",
+        basename(gpkg_file)
+      )
+    )
+  }
+  
+  for (layer_name in available_layers) {
+    
+    layer_object <- tryCatch(
+      sf::st_read(
+        dsn = gpkg_file,
+        layer = layer_name,
+        quiet = TRUE
+      ),
+      error = function(e) {
+        NULL
+      }
+    )
+    
+    if (is.null(layer_object)) {
+      next
+    }
+    
+    if (!inherits(layer_object, "sf")) {
+      next
+    }
+    
+    soil_field <- names(layer_object)[
+      toupper(names(layer_object)) ==
+        "SO_ASSOCIA"
+    ]
+    
+    if (length(soil_field) == 0) {
+      next
+    }
+    
+    soil_field <- soil_field[1]
+    
+    if (soil_field != "SO_ASSOCIA") {
+      
+      names(layer_object)[
+        names(layer_object) ==
+          soil_field
+      ] <- "SO_ASSOCIA"
+    }
+    
+    geometry_types <- unique(
+      as.character(
+        sf::st_geometry_type(
+          layer_object
+        )
+      )
+    )
+    
+    polygon_types <- c(
+      "POLYGON",
+      "MULTIPOLYGON"
+    )
+    
+    if (
+      any(
+        geometry_types %in%
+        polygon_types
+      )
+    ) {
+      return(layer_object)
+    }
+  }
+  
+  stop(
+    paste(
+      "No polygon layer containing SO_ASSOCIA",
+      "was found in:",
+      basename(gpkg_file)
+    )
+  )
+}
+
+
+# ============================================================
+# 13. Prepare and dissolve an extent
+#
+# soil_associations = NULL produces the total PHU.
+# A character vector produces a filtered peat extent.
+# ============================================================
+
+prepare_extent <- function(
+    phu_data,
+    soil_associations = NULL) {
+  
+  extent_data <- phu_data
+  
+  if (!is.null(soil_associations)) {
+    
+    selected_rows <-
+      matches_soil_association(
+        soil_values =
+          extent_data$SO_ASSOCIA,
+        target_associations =
+          soil_associations
+      )
+    
+    extent_data <- extent_data[
+      selected_rows,
+    ]
+  }
+  
+  if (nrow(extent_data) == 0) {
+    return(NULL)
+  }
+  
+  # Remove missing geometries
+  geometry_missing <- is.na(
+    sf::st_geometry(extent_data)
+  )
+  
+  extent_data <- extent_data[
+    !geometry_missing,
+  ]
+  
+  if (nrow(extent_data) == 0) {
+    return(NULL)
+  }
+  
+  # Remove empty geometries without assuming that the
+  # geometry column is named "geometry"
+  extent_data <- extent_data[
+    !sf::st_is_empty(extent_data),
+  ]
+  
+  if (nrow(extent_data) == 0) {
+    return(NULL)
+  }
+  
+  # Repair invalid geometries
+  extent_data <- sf::st_make_valid(
+    extent_data
+  )
+  
+  extent_data <- extent_data[
+    !sf::st_is_empty(extent_data),
+  ]
+  
+  if (nrow(extent_data) == 0) {
+    return(NULL)
+  }
+  
+  # Extract polygon components from geometry collections
+  extent_data <- suppressWarnings(
+    sf::st_collection_extract(
+      extent_data,
+      type = "POLYGON"
+    )
+  )
+  
+  if (nrow(extent_data) == 0) {
+    return(NULL)
+  }
+  
+  # Dissolve all polygons into one extent
+  dissolved_geometry <- sf::st_union(
+    sf::st_geometry(extent_data)
+  )
+  
+  dissolved_extent <- sf::st_sf(
+    extent_id = 1,
+    geometry = dissolved_geometry
+  )
+  
+  sf::st_crs(dissolved_extent) <-
+    sf::st_crs(extent_data)
+  
+  dissolved_extent
+}
+
+
+# ============================================================
+# 14. Calculate area in square kilometres
+#
+# EPSG:6933 is an equal-area coordinate system.
+# ============================================================
+
+calculate_area_km2 <- function(
+    polygon_object) {
+  
+  if (
+    is.null(polygon_object) ||
+    nrow(polygon_object) == 0
+  ) {
+    return(0)
+  }
+  
+  equal_area_polygon <- sf::st_transform(
+    polygon_object,
+    crs = 6933
+  )
+  
+  area_square_metres <- sum(
+    as.numeric(
+      sf::st_area(equal_area_polygon)
+    ),
+    na.rm = TRUE
+  )
+  
+  area_square_metres / 1e6
+}
+
+
+# ============================================================
+# 15. Extract population and calculate population density
+#
+# This function does not rely on the extracted raster column
+# having a particular name.
+# ============================================================
+
+summarise_population <- function(
+    polygon_object,
+    population_raster,
+    phu_name,
+    extent_type) {
+  
+  if (
+    is.null(polygon_object) ||
+    nrow(polygon_object) == 0
+  ) {
+    
+    return(
+      tibble::tibble(
+        PHU = phu_name,
+        Extent_type = extent_type,
+        Area_ha = 0,
+        Area_km2 = 0,
+        Population_2010 = 0,
+        Population_density_per_km2 =
+          NA_real_,
+        Raster_cells_intersected = 0
+      )
+    )
+  }
+  
+  if (is.na(sf::st_crs(polygon_object))) {
+    stop(
+      paste(
+        "Extent has no CRS:",
+        phu_name,
+        "-",
+        extent_type
+      )
+    )
+  }
+  
+  area_km2 <- calculate_area_km2(
+    polygon_object
+  )
+  
+  area_ha <- area_km2 * 100
+  
+  polygon_raster_crs <- sf::st_transform(
+    polygon_object,
+    crs = terra::crs(
+      population_raster
+    )
+  )
+  
+  extraction_list <-
+    exactextractr::exact_extract(
+      population_raster,
+      polygon_raster_crs,
+      progress = FALSE
+    )
+  
+  if (
+    length(extraction_list) == 0 ||
+    is.null(extraction_list[[1]]) ||
+    nrow(extraction_list[[1]]) == 0
+  ) {
+    
+    population_total <- 0
+    raster_cells <- 0
+    
+  } else {
+    
+    extraction <- extraction_list[[1]]
+    
+    if (
+      !"coverage_fraction" %in%
+      names(extraction)
+    ) {
+      stop(
+        paste(
+          "coverage_fraction was not returned for:",
+          phu_name,
+          "-",
+          extent_type
+        )
+      )
+    }
+    
+    # Identify raster-value columns by excluding columns
+    # created by exactextractr.
+    non_value_columns <- c(
+      "coverage_fraction",
+      "coverage_area",
+      "cell",
+      "x",
+      "y"
+    )
+    
+    value_columns <- setdiff(
+      names(extraction),
+      non_value_columns
+    )
+    
+    raster_layer_name <- names(
+      population_raster
+    )[1]
+    
+    if (
+      raster_layer_name %in%
+      names(extraction)
+    ) {
+      
+      value_column <- raster_layer_name
+      
+    } else if (
+      length(value_columns) == 1
+    ) {
+      
+      value_column <- value_columns[1]
+      
+    } else if (
+      length(value_columns) > 1
+    ) {
+      
+      numeric_value_columns <-
+        value_columns[
+          vapply(
+            extraction[value_columns],
+            is.numeric,
+            logical(1)
+          )
+        ]
+      
+      if (
+        length(numeric_value_columns) ==
+        1
+      ) {
+        
+        value_column <-
+          numeric_value_columns[1]
+        
+      } else {
+        
+        stop(
+          paste(
+            "Could not uniquely identify the",
+            "population raster column for:",
+            phu_name,
+            "-",
+            extent_type,
+            "| columns:",
+            paste(
+              names(extraction),
+              collapse = ", "
+            )
+          )
+        )
+      }
+      
+    } else {
+      
+      stop(
+        paste(
+          "No population raster-value column",
+          "was found for:",
+          phu_name,
+          "-",
+          extent_type,
+          "| columns:",
+          paste(
+            names(extraction),
+            collapse = ", "
+          )
+        )
+      )
+    }
+    
+    population_values <-
+      extraction[[value_column]]
+    
+    coverage_values <-
+      extraction[["coverage_fraction"]]
+    
+    valid_cells <- (
+      !is.na(population_values) &
+        is.finite(population_values) &
+        population_values >= 0 &
+        population_values < 1e20 &
+        !is.na(coverage_values) &
+        is.finite(coverage_values) &
+        coverage_values > 0
+    )
+    
+    if (!any(valid_cells)) {
+      
+      population_total <- 0
+      raster_cells <- 0
+      
+    } else {
+      
+      population_total <- sum(
+        population_values[valid_cells] *
+          coverage_values[valid_cells],
+        na.rm = TRUE
+      )
+      
+      raster_cells <- sum(
+        valid_cells
+      )
+    }
+  }
+  
+  population_density <- if (
+    is.finite(area_km2) &&
+    area_km2 > 0
+  ) {
+    
+    population_total / area_km2
+    
+  } else {
+    
+    NA_real_
+  }
+  
+  tibble::tibble(
+    PHU = phu_name,
+    Extent_type = extent_type,
+    Area_ha = area_ha,
+    Area_km2 = area_km2,
+    Population_2010 =
+      population_total,
+    Population_density_per_km2 =
+      population_density,
+    Raster_cells_intersected =
+      raster_cells
+  )
+}
+
+
+# ============================================================
+# 16. Process one PHU GeoPackage
+# ============================================================
+
+process_phu_file <- function(
+    gpkg_file,
+    population_raster) {
+  
+  phu_name <-
+    tools::file_path_sans_ext(
+      basename(gpkg_file)
+    )
+  
+  message(
+    "Processing: ",
+    phu_name
+  )
+  
+  phu_data <- read_phu_gpkg(
+    gpkg_file
+  )
+  
+  if (is.na(sf::st_crs(phu_data))) {
+    stop(
+      paste(
+        "The PHU layer has no CRS:",
+        basename(gpkg_file)
+      )
+    )
+  }
+  
+  phu_data <- phu_data |>
+    dplyr::mutate(
+      SO_ASSOCIA_CLEAN =
+        clean_soil_association(
+          SO_ASSOCIA
+        )
+    )
+  
+  total_phu <- prepare_extent(
+    phu_data = phu_data
+  )
+  
+  doa_peat <- prepare_extent(
+    phu_data = phu_data,
+    soil_associations =
+      doa_peat_associations
+  )
+  
+  sfd_peat <- prepare_extent(
+    phu_data = phu_data,
+    soil_associations =
+      sfd_peat_associations
+  )
+  
+  dplyr::bind_rows(
+    
+    summarise_population(
+      polygon_object = total_phu,
+      population_raster =
+        population_raster,
+      phu_name = phu_name,
+      extent_type = "Total PHU"
+    ),
+    
+    summarise_population(
+      polygon_object = doa_peat,
+      population_raster =
+        population_raster,
+      phu_name = phu_name,
+      extent_type =
+        "DoA peat extent"
+    ),
+    
+    summarise_population(
+      polygon_object = sfd_peat,
+      population_raster =
+        population_raster,
+      phu_name = phu_name,
+      extent_type =
+        "SFD peat extent"
+    )
+  )
+}
+
+
+# ============================================================
+# 17. Process every PHU
+# ============================================================
+
+population_results <- purrr::map_dfr(
+  phu_files,
+  function(gpkg_file) {
+    
+    tryCatch(
+      
+      process_phu_file(
+        gpkg_file = gpkg_file,
+        population_raster =
+          population_raster
+      ),
+      
+      error = function(e) {
+        
+        warning(
+          paste(
+            "Could not process",
+            basename(gpkg_file),
+            "-",
+            conditionMessage(e)
+          )
+        )
+        
+        tibble::tibble(
+          PHU =
+            tools::file_path_sans_ext(
+              basename(gpkg_file)
+            ),
+          Extent_type =
+            "Processing error",
+          Area_ha = NA_real_,
+          Area_km2 = NA_real_,
+          Population_2010 =
+            NA_real_,
+          Population_density_per_km2 =
+            NA_real_,
+          Raster_cells_intersected =
+            NA_integer_
+        )
+      }
+    )
+  }
+)
+
+
+# ============================================================
+# 18. Format long-format results
+# ============================================================
+
+extent_order <- c(
+  "Total PHU",
+  "DoA peat extent",
+  "SFD peat extent",
+  "Processing error"
+)
+
+population_results_formatted <-
+  population_results |>
+  dplyr::mutate(
+    Extent_type = factor(
+      Extent_type,
+      levels = extent_order
+    )
+  ) |>
+  dplyr::arrange(
+    PHU,
+    Extent_type
+  ) |>
+  dplyr::mutate(
+    Extent_type =
+      as.character(Extent_type),
+    Area_ha = round(
+      Area_ha,
+      1
+    ),
+    Area_km2 = round(
+      Area_km2,
+      2
+    ),
+    Population_2010 = round(
+      Population_2010
+    ),
+    Population_density_per_km2 =
+      round(
+        Population_density_per_km2,
+        2
+      )
+  ) |>
+  dplyr::select(
+    PHU,
+    Extent_type,
+    Area_ha,
+    Area_km2,
+    Population_2010,
+    Population_density_per_km2,
+    Raster_cells_intersected
+  )
+
+
+# ============================================================
+# 19. Create wide-format results
+# ============================================================
+
+population_results_wide <-
+  population_results_formatted |>
+  dplyr::filter(
+    Extent_type !=
+      "Processing error"
+  ) |>
+  dplyr::select(
+    PHU,
+    Extent_type,
+    Area_ha,
+    Area_km2,
+    Population_2010,
+    Population_density_per_km2
+  ) |>
+  tidyr::pivot_wider(
+    names_from = Extent_type,
+    values_from = c(
+      Area_ha,
+      Area_km2,
+      Population_2010,
+      Population_density_per_km2
+    ),
+    names_glue =
+      "{.value}_{Extent_type}"
+  ) |>
+  dplyr::rename_with(
+    function(column_name) {
+      
+      column_name |>
+        stringr::str_replace_all(
+          "[^A-Za-z0-9]+",
+          "_"
+        ) |>
+        stringr::str_replace_all(
+          "^_+|_+$",
+          ""
+        )
+    }
+  )
+
+
+# ============================================================
+# 20. Create SO_ASSOCIA classification audit
+# ============================================================
+
+soil_association_audit <- purrr::map_dfr(
+  phu_files,
+  function(gpkg_file) {
+    
+    phu_name <-
+      tools::file_path_sans_ext(
+        basename(gpkg_file)
+      )
+    
+    tryCatch(
+      {
+        
+        phu_data <- read_phu_gpkg(
+          gpkg_file
+        )
+        
+        phu_data |>
+          sf::st_drop_geometry() |>
+          dplyr::transmute(
+            PHU = phu_name,
+            SO_ASSOCIA =
+              as.character(
+                SO_ASSOCIA
+              ),
+            SO_ASSOCIA_CLEAN =
+              clean_soil_association(
+                SO_ASSOCIA
+              ),
+            Included_in_DoA_peat =
+              matches_soil_association(
+                SO_ASSOCIA,
+                doa_peat_associations
+              ),
+            Included_in_SFD_peat =
+              matches_soil_association(
+                SO_ASSOCIA,
+                sfd_peat_associations
+              )
+          ) |>
+          dplyr::distinct()
+      },
+      error = function(e) {
+        
+        tibble::tibble(
+          PHU = phu_name,
+          SO_ASSOCIA =
+            NA_character_,
+          SO_ASSOCIA_CLEAN =
+            NA_character_,
+          Included_in_DoA_peat =
+            NA,
+          Included_in_SFD_peat =
+            NA
+        )
+      }
+    )
+  }
+) |>
+  dplyr::arrange(
+    PHU,
+    SO_ASSOCIA_CLEAN
+  )
+
+
+# ============================================================
+# 21. Create processing-error table
+# ============================================================
+
+processing_errors <-
+  population_results_formatted |>
+  dplyr::filter(
+    Extent_type ==
+      "Processing error"
+  )
+
+
+# ============================================================
+# 22. Output file paths
+# ============================================================
+
+long_output_path <- file.path(
+  output_folder,
+  "PHU_population_2010_by_extent_long.csv"
+)
+
+wide_output_path <- file.path(
+  output_folder,
+  "PHU_population_2010_by_extent_wide.csv"
+)
+
+soil_audit_output_path <- file.path(
+  output_folder,
+  "PHU_SO_ASSOCIA_classification_audit.csv"
+)
+
+processing_error_output_path <- file.path(
+  output_folder,
+  "PHU_population_processing_errors.csv"
+)
+
+
+# ============================================================
+# 23. Save outputs
+# ============================================================
+
+readr::write_csv(
+  population_results_formatted,
+  long_output_path,
+  na = ""
+)
+
+readr::write_csv(
+  population_results_wide,
+  wide_output_path,
+  na = ""
+)
+
+readr::write_csv(
+  soil_association_audit,
+  soil_audit_output_path,
+  na = ""
+)
+
+readr::write_csv(
+  processing_errors,
+  processing_error_output_path,
+  na = ""
+)
+
+
+# ============================================================
+# 24. Print final results
+# ============================================================
+
+cat(
+  "\nFinal population results:\n\n"
+)
+
+print(
+  population_results_formatted,
+  n = Inf
+)
+
+
+# ============================================================
+# 25. Completion message
+# ============================================================
+
+cat(
+  "\nProcessing complete.\n\n",
+  "Long-format results:\n",
+  long_output_path,
+  "\n\n",
+  "Wide-format results:\n",
+  wide_output_path,
+  "\n\n",
+  "SO_ASSOCIA classification audit:\n",
+  soil_audit_output_path,
+  "\n\n",
+  "Processing-error table:\n",
+  processing_error_output_path,
+  "\n",
+  sep = ""
+)
+
+if (nrow(processing_errors) == 0) {
+  
+  cat(
+    "\nAll PHU GeoPackages were processed successfully.\n"
+  )
+  
+} else {
+  
+  cat(
+    "\nSome PHUs could not be processed.",
+    "Run warnings() to view the errors.\n"
+  )
+}
