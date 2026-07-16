@@ -1,0 +1,1891 @@
+# ============================================================
+# FOREST-RESERVE CLASS AREA BY PHU AND SABAH PEAT EXTENT
+#
+# Calculates forest-reserve area by FR_CLASS for:
+#
+#   1. Total area of each PHU
+#   2. DoA peat extent in each PHU
+#      Sapi, Klias, Sipitang and Usukan soil associations
+#   3. SFD peat extent in each PHU
+#      Klias and Sipitang soil associations
+#   4. Total Sabah DoA peat extent
+#   5. Total Sabah SFD peat extent
+#
+# Also calculates:
+#   - area outside mapped forest reserves;
+#   - percentage of each extent in each forest class;
+#   - total area inside and outside forest reserves;
+#   - area-reconciliation checks;
+#   - audits of SO_ASSOCIA and FR_CLASS values.
+#
+# The script repairs invalid geometries before spatial overlays.
+# It does not assume that the spatial geometry column is named
+# "geometry".
+# ============================================================
+
+
+# ============================================================
+# 1. Required packages
+# ============================================================
+
+required_packages <- c(
+  "sf",
+  "dplyr",
+  "purrr",
+  "stringr",
+  "tidyr",
+  "readr",
+  "tibble"
+)
+
+packages_to_install <- required_packages[
+  !required_packages %in%
+    rownames(installed.packages())
+]
+
+if (length(packages_to_install) > 0) {
+  
+  install.packages(
+    packages_to_install,
+    dependencies = TRUE
+  )
+}
+
+
+# ============================================================
+# 2. Load packages
+# ============================================================
+
+library(sf)
+library(dplyr)
+library(purrr)
+library(stringr)
+library(tidyr)
+library(readr)
+library(tibble)
+
+
+# ============================================================
+# 3. File paths
+# ============================================================
+
+phu_folder <- paste0(
+  "C:/Users/User/Documents/Peatland/GIS/",
+  "PHU-extent"
+)
+
+forest_reserve_path <- paste0(
+  "C:/Users/User/Documents/palmdrive/",
+  "ForestReserves2023.gpkg"
+)
+
+sabah_peat_path <- paste0(
+  "C:/Users/User/Documents/Peatland/GIS/",
+  "PealandSabah.shp"
+)
+
+output_folder <- paste0(
+  "C:/Users/User/Documents/Peatland/GIS/",
+  "PHU-forest-class-results"
+)
+
+
+# ============================================================
+# 4. Create output folder
+# ============================================================
+
+if (!dir.exists(output_folder)) {
+  
+  dir.create(
+    output_folder,
+    recursive = TRUE
+  )
+}
+
+
+# ============================================================
+# 5. Check input paths
+# ============================================================
+
+if (!dir.exists(phu_folder)) {
+  
+  stop(
+    paste(
+      "PHU folder not found:",
+      phu_folder
+    )
+  )
+}
+
+if (!file.exists(forest_reserve_path)) {
+  
+  stop(
+    paste(
+      "Forest-reserve GeoPackage not found:",
+      forest_reserve_path
+    )
+  )
+}
+
+if (!file.exists(sabah_peat_path)) {
+  
+  stop(
+    paste(
+      "Sabah peat shapefile not found:",
+      sabah_peat_path
+    )
+  )
+}
+
+phu_files <- list.files(
+  path = phu_folder,
+  pattern = "\\.gpkg$",
+  full.names = TRUE,
+  ignore.case = TRUE
+)
+
+if (length(phu_files) == 0) {
+  
+  stop(
+    paste(
+      "No PHU GeoPackages found in:",
+      phu_folder
+    )
+  )
+}
+
+
+# ============================================================
+# 6. Analysis settings
+# ============================================================
+
+# Equal-area CRS used for spatial overlays and area calculations.
+analysis_crs <- 6933
+
+doa_peat_associations <- c(
+  "SAPI",
+  "KLIAS",
+  "SIPITANG",
+  "USUKAN"
+)
+
+sfd_peat_associations <- c(
+  "KLIAS",
+  "SIPITANG"
+)
+
+
+# ============================================================
+# 7. Text-cleaning functions
+# ============================================================
+
+clean_text <- function(x) {
+  
+  x |>
+    as.character() |>
+    stringr::str_squish() |>
+    stringr::str_to_upper()
+}
+
+
+clean_forest_class <- function(x) {
+  
+  cleaned_value <- x |>
+    as.character() |>
+    stringr::str_squish()
+  
+  cleaned_value[
+    is.na(cleaned_value) |
+      cleaned_value == ""
+  ] <- "Forest reserve - class not recorded"
+  
+  cleaned_value
+}
+
+
+# ============================================================
+# 8. Standardise a field name
+#
+# This finds a field case-insensitively and renames it to the
+# requested standard name.
+# ============================================================
+
+standardise_field_name <- function(
+    spatial_object,
+    required_name) {
+  
+  matching_fields <- names(spatial_object)[
+    toupper(names(spatial_object)) ==
+      toupper(required_name)
+  ]
+  
+  if (length(matching_fields) == 0) {
+    
+    stop(
+      paste(
+        "Required field not found:",
+        required_name
+      )
+    )
+  }
+  
+  current_name <- matching_fields[1]
+  
+  if (current_name != required_name) {
+    
+    names(spatial_object)[
+      names(spatial_object) ==
+        current_name
+    ] <- required_name
+  }
+  
+  spatial_object
+}
+
+
+# ============================================================
+# 9. Match soil associations
+#
+# This permits values such as:
+#   Klias
+#   Klias Association
+#   KLIAS SOIL ASSOCIATION
+#   Klias / Sipitang
+# ============================================================
+
+matches_soil_association <- function(
+    soil_values,
+    target_associations) {
+  
+  cleaned_values <- clean_text(
+    soil_values
+  )
+  
+  association_pattern <- paste0(
+    "\\b(",
+    paste(
+      target_associations,
+      collapse = "|"
+    ),
+    ")\\b"
+  )
+  
+  !is.na(cleaned_values) &
+    stringr::str_detect(
+      cleaned_values,
+      association_pattern
+    )
+}
+
+
+# ============================================================
+# 10. Clean and repair polygon geometries
+#
+# This function:
+#   - removes missing geometry;
+#   - removes empty geometry;
+#   - repairs invalid geometry;
+#   - extracts polygon parts from geometry collections;
+#   - repairs geometry again after extraction;
+#   - does not assume the geometry column is named geometry.
+# ============================================================
+
+clean_polygon_geometry <- function(
+    spatial_object,
+    object_name = "spatial object") {
+  
+  if (!inherits(spatial_object, "sf")) {
+    
+    stop(
+      paste(
+        object_name,
+        "is not an sf object."
+      )
+    )
+  }
+  
+  if (is.na(sf::st_crs(spatial_object))) {
+    
+    stop(
+      paste(
+        object_name,
+        "does not have a defined CRS."
+      )
+    )
+  }
+  
+  if (nrow(spatial_object) == 0) {
+    
+    return(spatial_object)
+  }
+  
+  # Remove missing geometry
+  geometry_missing <- is.na(
+    sf::st_geometry(spatial_object)
+  )
+  
+  spatial_object <- spatial_object[
+    !geometry_missing,
+  ]
+  
+  if (nrow(spatial_object) == 0) {
+    
+    return(spatial_object)
+  }
+  
+  # Remove empty geometry
+  spatial_object <- spatial_object[
+    !sf::st_is_empty(spatial_object),
+  ]
+  
+  if (nrow(spatial_object) == 0) {
+    
+    return(spatial_object)
+  }
+  
+  # Repair invalid geometry
+  spatial_object <- suppressWarnings(
+    sf::st_make_valid(
+      spatial_object
+    )
+  )
+  
+  # Remove missing or empty geometry created during repair
+  spatial_object <- spatial_object[
+    !is.na(sf::st_geometry(spatial_object)),
+  ]
+  
+  spatial_object <- spatial_object[
+    !sf::st_is_empty(spatial_object),
+  ]
+  
+  if (nrow(spatial_object) == 0) {
+    
+    return(spatial_object)
+  }
+  
+  geometry_types <- unique(
+    as.character(
+      sf::st_geometry_type(
+        spatial_object
+      )
+    )
+  )
+  
+  # Extract polygon components if geometry collections
+  # or non-polygon components are present
+  if (
+    any(
+      geometry_types %in%
+      c(
+        "GEOMETRYCOLLECTION",
+        "LINESTRING",
+        "MULTILINESTRING",
+        "POINT",
+        "MULTIPOINT"
+      )
+    )
+  ) {
+    
+    spatial_object <- suppressWarnings(
+      sf::st_collection_extract(
+        spatial_object,
+        type = "POLYGON",
+        warn = FALSE
+      )
+    )
+  }
+  
+  if (nrow(spatial_object) == 0) {
+    
+    return(spatial_object)
+  }
+  
+  # Final repair
+  spatial_object <- suppressWarnings(
+    sf::st_make_valid(
+      spatial_object
+    )
+  )
+  
+  spatial_object <- spatial_object[
+    !sf::st_is_empty(spatial_object),
+  ]
+  
+  spatial_object
+}
+
+
+# ============================================================
+# 11. Read the appropriate PHU layer
+#
+# Searches all layers in each GeoPackage and returns the first
+# polygon layer containing SO_ASSOCIA.
+# ============================================================
+
+read_phu_gpkg <- function(gpkg_file) {
+  
+  layer_information <- sf::st_layers(
+    gpkg_file
+  )
+  
+  available_layers <- layer_information$name
+  
+  if (length(available_layers) == 0) {
+    
+    stop(
+      paste(
+        "No layers found in:",
+        basename(gpkg_file)
+      )
+    )
+  }
+  
+  for (layer_name in available_layers) {
+    
+    layer_object <- tryCatch(
+      sf::st_read(
+        dsn = gpkg_file,
+        layer = layer_name,
+        quiet = TRUE
+      ),
+      error = function(e) {
+        
+        NULL
+      }
+    )
+    
+    if (is.null(layer_object)) {
+      
+      next
+    }
+    
+    if (!inherits(layer_object, "sf")) {
+      
+      next
+    }
+    
+    soil_field <- names(layer_object)[
+      toupper(names(layer_object)) ==
+        "SO_ASSOCIA"
+    ]
+    
+    if (length(soil_field) == 0) {
+      
+      next
+    }
+    
+    geometry_types <- unique(
+      as.character(
+        sf::st_geometry_type(
+          layer_object
+        )
+      )
+    )
+    
+    acceptable_types <- c(
+      "POLYGON",
+      "MULTIPOLYGON",
+      "GEOMETRYCOLLECTION"
+    )
+    
+    if (
+      !any(
+        geometry_types %in%
+        acceptable_types
+      )
+    ) {
+      
+      next
+    }
+    
+    layer_object <- standardise_field_name(
+      spatial_object = layer_object,
+      required_name = "SO_ASSOCIA"
+    )
+    
+    layer_object <- clean_polygon_geometry(
+      spatial_object = layer_object,
+      object_name = basename(gpkg_file)
+    )
+    
+    return(layer_object)
+  }
+  
+  stop(
+    paste(
+      "No polygon layer containing SO_ASSOCIA",
+      "was found in:",
+      basename(gpkg_file)
+    )
+  )
+}
+
+
+# ============================================================
+# 12. Read forest-reserve layer
+#
+# Searches all GeoPackage layers and returns the first polygon
+# layer containing FR_CLASS.
+# ============================================================
+
+read_forest_reserves <- function(gpkg_file) {
+  
+  layer_information <- sf::st_layers(
+    gpkg_file
+  )
+  
+  available_layers <- layer_information$name
+  
+  if (length(available_layers) == 0) {
+    
+    stop(
+      paste(
+        "No layers found in:",
+        gpkg_file
+      )
+    )
+  }
+  
+  for (layer_name in available_layers) {
+    
+    layer_object <- tryCatch(
+      sf::st_read(
+        dsn = gpkg_file,
+        layer = layer_name,
+        quiet = TRUE
+      ),
+      error = function(e) {
+        
+        NULL
+      }
+    )
+    
+    if (is.null(layer_object)) {
+      
+      next
+    }
+    
+    if (!inherits(layer_object, "sf")) {
+      
+      next
+    }
+    
+    forest_class_field <- names(layer_object)[
+      toupper(names(layer_object)) ==
+        "FR_CLASS"
+    ]
+    
+    if (length(forest_class_field) == 0) {
+      
+      next
+    }
+    
+    geometry_types <- unique(
+      as.character(
+        sf::st_geometry_type(
+          layer_object
+        )
+      )
+    )
+    
+    acceptable_types <- c(
+      "POLYGON",
+      "MULTIPOLYGON",
+      "GEOMETRYCOLLECTION"
+    )
+    
+    if (
+      !any(
+        geometry_types %in%
+        acceptable_types
+      )
+    ) {
+      
+      next
+    }
+    
+    layer_object <- standardise_field_name(
+      spatial_object = layer_object,
+      required_name = "FR_CLASS"
+    )
+    
+    layer_object <- clean_polygon_geometry(
+      spatial_object = layer_object,
+      object_name = "Forest-reserve layer"
+    )
+    
+    return(layer_object)
+  }
+  
+  stop(
+    paste(
+      "No polygon layer containing FR_CLASS",
+      "was found in:",
+      gpkg_file
+    )
+  )
+}
+
+
+# ============================================================
+# 13. Prepare and dissolve one source extent
+#
+# soil_associations = NULL returns the full input extent.
+# ============================================================
+
+prepare_extent <- function(
+    spatial_data,
+    soil_associations = NULL,
+    extent_name = "source extent") {
+  
+  extent_data <- spatial_data
+  
+  if (!is.null(soil_associations)) {
+    
+    selected_rows <- matches_soil_association(
+      soil_values =
+        extent_data$SO_ASSOCIA,
+      target_associations =
+        soil_associations
+    )
+    
+    extent_data <- extent_data[
+      selected_rows,
+    ]
+  }
+  
+  if (nrow(extent_data) == 0) {
+    
+    return(NULL)
+  }
+  
+  extent_data <- clean_polygon_geometry(
+    spatial_object = extent_data,
+    object_name = extent_name
+  )
+  
+  if (nrow(extent_data) == 0) {
+    
+    return(NULL)
+  }
+  
+  dissolved_geometry <- suppressWarnings(
+    sf::st_union(
+      sf::st_geometry(
+        extent_data
+      )
+    )
+  )
+  
+  dissolved_extent <- sf::st_sf(
+    extent_id = 1,
+    geom = dissolved_geometry
+  )
+  
+  sf::st_crs(dissolved_extent) <-
+    sf::st_crs(extent_data)
+  
+  dissolved_extent <- clean_polygon_geometry(
+    spatial_object = dissolved_extent,
+    object_name = paste(
+      extent_name,
+      "dissolved"
+    )
+  )
+  
+  dissolved_extent
+}
+
+
+# ============================================================
+# 14. Calculate area in hectares
+# ============================================================
+
+calculate_area_ha <- function(spatial_object) {
+  
+  if (
+    is.null(spatial_object) ||
+    nrow(spatial_object) == 0
+  ) {
+    
+    return(0)
+  }
+  
+  equal_area_object <- sf::st_transform(
+    spatial_object,
+    crs = analysis_crs
+  )
+  
+  sum(
+    as.numeric(
+      sf::st_area(
+        equal_area_object
+      )
+    ),
+    na.rm = TRUE
+  ) / 10000
+}
+
+
+# ============================================================
+# 15. Read and prepare forest reserves
+# ============================================================
+
+message(
+  "Reading forest-reserve layer..."
+)
+
+forest_reserves <- read_forest_reserves(
+  forest_reserve_path
+)
+
+forest_reserves <- forest_reserves |>
+  dplyr::mutate(
+    Forest_class =
+      clean_forest_class(
+        FR_CLASS
+      )
+  ) |>
+  dplyr::select(
+    Forest_class
+  )
+
+forest_reserves <- sf::st_transform(
+  forest_reserves,
+  crs = analysis_crs
+)
+
+forest_reserves <- clean_polygon_geometry(
+  spatial_object = forest_reserves,
+  object_name =
+    "Forest reserves after transformation"
+)
+
+
+# ============================================================
+# 16. Forest-reserve geometry check
+# ============================================================
+
+cat(
+  "\nForest-reserve features:",
+  nrow(forest_reserves),
+  "\n"
+)
+
+cat(
+  "Invalid forest-reserve geometries after repair:",
+  sum(
+    !sf::st_is_valid(
+      forest_reserves
+    )
+  ),
+  "\n\n"
+)
+
+
+# ============================================================
+# 17. Forest-class audit before dissolving
+# ============================================================
+
+forest_class_audit <- forest_reserves |>
+  sf::st_drop_geometry() |>
+  dplyr::count(
+    Forest_class,
+    name = "Number_of_features"
+  ) |>
+  dplyr::arrange(
+    Forest_class
+  )
+
+
+# ============================================================
+# 18. Dissolve forest reserves by forest class
+#
+# sf::summarise() automatically dissolves whichever geometry
+# column is registered as the active geometry.
+# ============================================================
+
+message(
+  "Dissolving forest reserves by FR_CLASS..."
+)
+
+forest_reserves_by_class <-
+  forest_reserves |>
+  dplyr::group_by(
+    Forest_class
+  ) |>
+  dplyr::summarise(
+    do_union = TRUE,
+    .groups = "drop"
+  )
+
+forest_reserves_by_class <-
+  clean_polygon_geometry(
+    spatial_object =
+      forest_reserves_by_class,
+    object_name =
+      "Dissolved forest-reserve classes"
+  )
+
+
+# ============================================================
+# 19. Create one combined forest-reserve footprint
+#
+# Used to calculate area outside all mapped forest reserves.
+# ============================================================
+
+forest_reserve_union <- suppressWarnings(
+  sf::st_union(
+    sf::st_geometry(
+      forest_reserves_by_class
+    )
+  )
+)
+
+forest_reserve_footprint <- sf::st_sf(
+  reserve_id = 1,
+  geom = forest_reserve_union
+)
+
+sf::st_crs(forest_reserve_footprint) <-
+  sf::st_crs(forest_reserves_by_class)
+
+forest_reserve_footprint <-
+  clean_polygon_geometry(
+    spatial_object =
+      forest_reserve_footprint,
+    object_name =
+      "Combined forest-reserve footprint"
+  )
+
+
+# ============================================================
+# 20. Summarise forest classes for one extent
+# ============================================================
+
+summarise_forest_classes <- function(
+    source_extent,
+    source_name,
+    extent_type) {
+  
+  # ----------------------------------------------------------
+  # Missing extent
+  # ----------------------------------------------------------
+  
+  if (
+    is.null(source_extent) ||
+    nrow(source_extent) == 0
+  ) {
+    
+    return(
+      tibble::tibble(
+        Area_name = source_name,
+        Extent_type = extent_type,
+        Forest_class = "No matching extent",
+        Extent_area_ha = 0,
+        Forest_class_area_ha = 0,
+        Percentage_of_extent =
+          NA_real_
+      )
+    )
+  }
+  
+  
+  # ----------------------------------------------------------
+  # Transform and clean source extent
+  # ----------------------------------------------------------
+  
+  source_extent <- sf::st_transform(
+    source_extent,
+    crs = analysis_crs
+  )
+  
+  source_extent <- clean_polygon_geometry(
+    spatial_object = source_extent,
+    object_name = paste(
+      source_name,
+      extent_type
+    )
+  )
+  
+  if (nrow(source_extent) == 0) {
+    
+    return(
+      tibble::tibble(
+        Area_name = source_name,
+        Extent_type = extent_type,
+        Forest_class = "No valid geometry",
+        Extent_area_ha = 0,
+        Forest_class_area_ha = 0,
+        Percentage_of_extent =
+          NA_real_
+      )
+    )
+  }
+  
+  
+  # ----------------------------------------------------------
+  # Dissolve source extent
+  # ----------------------------------------------------------
+  
+  source_union <- suppressWarnings(
+    sf::st_union(
+      sf::st_geometry(
+        source_extent
+      )
+    )
+  )
+  
+  source_extent <- sf::st_sf(
+    extent_id = 1,
+    geom = source_union
+  )
+  
+  sf::st_crs(source_extent) <-
+    analysis_crs
+  
+  source_extent <- clean_polygon_geometry(
+    spatial_object = source_extent,
+    object_name = paste(
+      source_name,
+      extent_type,
+      "dissolved extent"
+    )
+  )
+  
+  if (nrow(source_extent) == 0) {
+    
+    return(
+      tibble::tibble(
+        Area_name = source_name,
+        Extent_type = extent_type,
+        Forest_class = "No valid geometry",
+        Extent_area_ha = 0,
+        Forest_class_area_ha = 0,
+        Percentage_of_extent =
+          NA_real_
+      )
+    )
+  }
+  
+  
+  # ----------------------------------------------------------
+  # Total extent area
+  # ----------------------------------------------------------
+  
+  total_extent_area_ha <- calculate_area_ha(
+    source_extent
+  )
+  
+  
+  # ----------------------------------------------------------
+  # Intersect source extent with forest-reserve classes
+  # ----------------------------------------------------------
+  
+  class_intersections <- tryCatch(
+    suppressWarnings(
+      sf::st_intersection(
+        forest_reserves_by_class,
+        source_extent
+      )
+    ),
+    error = function(e) {
+      
+      warning(
+        paste(
+          "Forest-class intersection failed for",
+          source_name,
+          "-",
+          extent_type,
+          ":",
+          conditionMessage(e)
+        )
+      )
+      
+      NULL
+    }
+  )
+  
+  
+  # ----------------------------------------------------------
+  # Calculate area in each forest class
+  # ----------------------------------------------------------
+  
+  if (
+    !is.null(class_intersections) &&
+    nrow(class_intersections) > 0
+  ) {
+    
+    class_intersections <-
+      clean_polygon_geometry(
+        spatial_object =
+          class_intersections,
+        object_name = paste(
+          source_name,
+          extent_type,
+          "forest-class intersection"
+        )
+      )
+  }
+  
+  if (
+    !is.null(class_intersections) &&
+    nrow(class_intersections) > 0
+  ) {
+    
+    class_intersections$Forest_class_area_ha <-
+      as.numeric(
+        sf::st_area(
+          class_intersections
+        )
+      ) / 10000
+    
+    class_results <-
+      class_intersections |>
+      sf::st_drop_geometry() |>
+      dplyr::group_by(
+        Forest_class
+      ) |>
+      dplyr::summarise(
+        Forest_class_area_ha =
+          sum(
+            Forest_class_area_ha,
+            na.rm = TRUE
+          ),
+        .groups = "drop"
+      )
+    
+  } else {
+    
+    class_results <- tibble::tibble(
+      Forest_class = character(),
+      Forest_class_area_ha = numeric()
+    )
+  }
+  
+  
+  # ----------------------------------------------------------
+  # Calculate area outside forest reserves
+  # ----------------------------------------------------------
+  
+  outside_reserve <- tryCatch(
+    suppressWarnings(
+      sf::st_difference(
+        source_extent,
+        forest_reserve_footprint
+      )
+    ),
+    error = function(e) {
+      
+      warning(
+        paste(
+          "Outside-reserve calculation failed for",
+          source_name,
+          "-",
+          extent_type,
+          ":",
+          conditionMessage(e)
+        )
+      )
+      
+      NULL
+    }
+  )
+  
+  if (
+    is.null(outside_reserve) ||
+    nrow(outside_reserve) == 0
+  ) {
+    
+    outside_area_ha <- 0
+    
+  } else {
+    
+    outside_reserve <- clean_polygon_geometry(
+      spatial_object = outside_reserve,
+      object_name = paste(
+        source_name,
+        extent_type,
+        "outside forest reserves"
+      )
+    )
+    
+    if (nrow(outside_reserve) == 0) {
+      
+      outside_area_ha <- 0
+      
+    } else {
+      
+      outside_area_ha <- calculate_area_ha(
+        outside_reserve
+      )
+    }
+  }
+  
+  
+  outside_result <- tibble::tibble(
+    Forest_class =
+      "Outside forest reserves",
+    Forest_class_area_ha =
+      outside_area_ha
+  )
+  
+  
+  # ----------------------------------------------------------
+  # Combine results
+  # ----------------------------------------------------------
+  
+  final_results <- dplyr::bind_rows(
+    class_results,
+    outside_result
+  )
+  
+  final_results$Area_name <-
+    source_name
+  
+  final_results$Extent_type <-
+    extent_type
+  
+  final_results$Extent_area_ha <-
+    total_extent_area_ha
+  
+  if (
+    is.finite(total_extent_area_ha) &&
+    total_extent_area_ha > 0
+  ) {
+    
+    final_results$Percentage_of_extent <-
+      final_results$Forest_class_area_ha /
+      total_extent_area_ha *
+      100
+    
+  } else {
+    
+    final_results$Percentage_of_extent <-
+      NA_real_
+  }
+  
+  final_results |>
+    dplyr::select(
+      Area_name,
+      Extent_type,
+      Forest_class,
+      Extent_area_ha,
+      Forest_class_area_ha,
+      Percentage_of_extent
+    )
+}
+
+
+# ============================================================
+# 21. Process one PHU
+# ============================================================
+
+process_phu <- function(gpkg_file) {
+  
+  phu_name <- tools::file_path_sans_ext(
+    basename(gpkg_file)
+  )
+  
+  message(
+    "Processing PHU: ",
+    phu_name
+  )
+  
+  phu_data <- read_phu_gpkg(
+    gpkg_file
+  )
+  
+  invalid_count <- sum(
+    !sf::st_is_valid(
+      phu_data
+    )
+  )
+  
+  if (invalid_count > 0) {
+    
+    warning(
+      paste(
+        phu_name,
+        "still contains",
+        invalid_count,
+        "invalid geometries after repair."
+      )
+    )
+  }
+  
+  
+  # ----------------------------------------------------------
+  # Total PHU
+  # ----------------------------------------------------------
+  
+  total_phu <- prepare_extent(
+    spatial_data = phu_data,
+    soil_associations = NULL,
+    extent_name = paste(
+      phu_name,
+      "total PHU"
+    )
+  )
+  
+  
+  # ----------------------------------------------------------
+  # DoA peat extent
+  # ----------------------------------------------------------
+  
+  doa_peat <- prepare_extent(
+    spatial_data = phu_data,
+    soil_associations =
+      doa_peat_associations,
+    extent_name = paste(
+      phu_name,
+      "DoA peat"
+    )
+  )
+  
+  
+  # ----------------------------------------------------------
+  # SFD peat extent
+  # ----------------------------------------------------------
+  
+  sfd_peat <- prepare_extent(
+    spatial_data = phu_data,
+    soil_associations =
+      sfd_peat_associations,
+    extent_name = paste(
+      phu_name,
+      "SFD peat"
+    )
+  )
+  
+  
+  # ----------------------------------------------------------
+  # Forest-class summaries
+  # ----------------------------------------------------------
+  
+  dplyr::bind_rows(
+    
+    summarise_forest_classes(
+      source_extent = total_phu,
+      source_name = phu_name,
+      extent_type = "Total PHU"
+    ),
+    
+    summarise_forest_classes(
+      source_extent = doa_peat,
+      source_name = phu_name,
+      extent_type =
+        "DoA peat extent"
+    ),
+    
+    summarise_forest_classes(
+      source_extent = sfd_peat,
+      source_name = phu_name,
+      extent_type =
+        "SFD peat extent"
+    )
+  )
+}
+
+
+# ============================================================
+# 22. Process all PHUs
+# ============================================================
+
+phu_results <- purrr::map_dfr(
+  phu_files,
+  function(gpkg_file) {
+    
+    tryCatch(
+      process_phu(
+        gpkg_file
+      ),
+      error = function(e) {
+        
+        warning(
+          paste(
+            "Could not process",
+            basename(gpkg_file),
+            "-",
+            conditionMessage(e)
+          )
+        )
+        
+        tibble::tibble(
+          Area_name =
+            tools::file_path_sans_ext(
+              basename(gpkg_file)
+            ),
+          Extent_type =
+            "Processing error",
+          Forest_class =
+            NA_character_,
+          Extent_area_ha =
+            NA_real_,
+          Forest_class_area_ha =
+            NA_real_,
+          Percentage_of_extent =
+            NA_real_
+        )
+      }
+    )
+  }
+)
+
+
+# ============================================================
+# 23. Read statewide Sabah peat layer
+# ============================================================
+
+message(
+  "Reading statewide Sabah peat layer..."
+)
+
+sabah_peat <- sf::st_read(
+  sabah_peat_path,
+  quiet = TRUE
+)
+
+sabah_peat <- standardise_field_name(
+  spatial_object = sabah_peat,
+  required_name = "SO_ASSOCIA"
+)
+
+sabah_peat <- clean_polygon_geometry(
+  spatial_object = sabah_peat,
+  object_name = "Sabah peat layer"
+)
+
+cat(
+  "\nSabah peat features:",
+  nrow(sabah_peat),
+  "\n"
+)
+
+cat(
+  "Invalid Sabah peat geometries after repair:",
+  sum(
+    !sf::st_is_valid(
+      sabah_peat
+    )
+  ),
+  "\n\n"
+)
+
+
+# ============================================================
+# 24. Prepare statewide peat definitions
+# ============================================================
+
+sabah_doa_peat <- prepare_extent(
+  spatial_data = sabah_peat,
+  soil_associations =
+    doa_peat_associations,
+  extent_name =
+    "Total Sabah DoA peat"
+)
+
+sabah_sfd_peat <- prepare_extent(
+  spatial_data = sabah_peat,
+  soil_associations =
+    sfd_peat_associations,
+  extent_name =
+    "Total Sabah SFD peat"
+)
+
+
+# ============================================================
+# 25. Calculate statewide forest-class results
+# ============================================================
+
+message(
+  "Processing statewide Sabah peat extents..."
+)
+
+sabah_results <- dplyr::bind_rows(
+  
+  summarise_forest_classes(
+    source_extent = sabah_doa_peat,
+    source_name = "Sabah",
+    extent_type =
+      "Total Sabah DoA peat extent"
+  ),
+  
+  summarise_forest_classes(
+    source_extent = sabah_sfd_peat,
+    source_name = "Sabah",
+    extent_type =
+      "Total Sabah SFD peat extent"
+  )
+)
+
+
+# ============================================================
+# 26. Combine PHU and statewide results
+# ============================================================
+
+all_results <- dplyr::bind_rows(
+  phu_results,
+  sabah_results
+)
+
+
+# ============================================================
+# 27. Format results
+# ============================================================
+
+results_formatted <- all_results |>
+  dplyr::mutate(
+    Extent_area_ha = round(
+      Extent_area_ha,
+      1
+    ),
+    Forest_class_area_ha = round(
+      Forest_class_area_ha,
+      1
+    ),
+    Percentage_of_extent = round(
+      Percentage_of_extent,
+      2
+    )
+  ) |>
+  dplyr::arrange(
+    Area_name,
+    Extent_type,
+    Forest_class
+  )
+
+
+# ============================================================
+# 28. Create compact forest-reserve summary
+# ============================================================
+
+reserve_summary <- results_formatted |>
+  dplyr::filter(
+    Extent_type !=
+      "Processing error",
+    !Forest_class %in%
+      c(
+        "No matching extent",
+        "No valid geometry"
+      )
+  ) |>
+  dplyr::group_by(
+    Area_name,
+    Extent_type,
+    Extent_area_ha
+  ) |>
+  dplyr::summarise(
+    Area_in_forest_reserves_ha =
+      sum(
+        Forest_class_area_ha[
+          Forest_class !=
+            "Outside forest reserves"
+        ],
+        na.rm = TRUE
+      ),
+    Area_outside_forest_reserves_ha =
+      sum(
+        Forest_class_area_ha[
+          Forest_class ==
+            "Outside forest reserves"
+        ],
+        na.rm = TRUE
+      ),
+    .groups = "drop"
+  ) |>
+  dplyr::mutate(
+    Percentage_in_forest_reserves =
+      dplyr::if_else(
+        Extent_area_ha > 0,
+        Area_in_forest_reserves_ha /
+          Extent_area_ha *
+          100,
+        NA_real_
+      ),
+    Percentage_outside_forest_reserves =
+      dplyr::if_else(
+        Extent_area_ha > 0,
+        Area_outside_forest_reserves_ha /
+          Extent_area_ha *
+          100,
+        NA_real_
+      )
+  ) |>
+  dplyr::mutate(
+    dplyr::across(
+      where(is.numeric),
+      ~ round(.x, 2)
+    )
+  )
+
+
+# ============================================================
+# 29. Create wide-format results
+# ============================================================
+
+results_wide <- results_formatted |>
+  dplyr::filter(
+    Extent_type !=
+      "Processing error"
+  ) |>
+  dplyr::select(
+    Area_name,
+    Extent_type,
+    Extent_area_ha,
+    Forest_class,
+    Forest_class_area_ha
+  ) |>
+  tidyr::pivot_wider(
+    names_from =
+      Forest_class,
+    values_from =
+      Forest_class_area_ha,
+    values_fill = 0,
+    names_prefix =
+      "Area_ha_"
+  ) |>
+  dplyr::rename_with(
+    function(column_name) {
+      
+      column_name |>
+        stringr::str_replace_all(
+          "[^A-Za-z0-9]+",
+          "_"
+        ) |>
+        stringr::str_replace_all(
+          "^_+|_+$",
+          ""
+        )
+    }
+  )
+
+
+# ============================================================
+# 30. Area reconciliation check
+#
+# The sum of:
+#   forest-class areas + outside-reserve area
+#
+# should approximately equal the source extent.
+#
+# A positive difference may indicate overlapping polygons
+# assigned to different forest classes.
+# ============================================================
+
+area_reconciliation <- results_formatted |>
+  dplyr::filter(
+    Extent_type !=
+      "Processing error",
+    !Forest_class %in%
+      c(
+        "No matching extent",
+        "No valid geometry"
+      )
+  ) |>
+  dplyr::group_by(
+    Area_name,
+    Extent_type,
+    Extent_area_ha
+  ) |>
+  dplyr::summarise(
+    Sum_of_class_and_outside_areas_ha =
+      sum(
+        Forest_class_area_ha,
+        na.rm = TRUE
+      ),
+    Difference_ha =
+      Sum_of_class_and_outside_areas_ha -
+      dplyr::first(
+        Extent_area_ha
+      ),
+    .groups = "drop"
+  ) |>
+  dplyr::mutate(
+    dplyr::across(
+      where(is.numeric),
+      ~ round(.x, 2)
+    ),
+    Reconciliation_status =
+      dplyr::case_when(
+        abs(Difference_ha) <= 1 ~
+          "OK",
+        Difference_ha > 1 ~
+          "Possible overlap between forest classes",
+        Difference_ha < -1 ~
+          "Possible missing area",
+        TRUE ~
+          "Check"
+      )
+  )
+
+
+# ============================================================
+# 31. PHU SO_ASSOCIA audit
+# ============================================================
+
+phu_soil_audit <- purrr::map_dfr(
+  phu_files,
+  function(gpkg_file) {
+    
+    phu_name <- tools::file_path_sans_ext(
+      basename(gpkg_file)
+    )
+    
+    tryCatch(
+      {
+        
+        phu_data <- read_phu_gpkg(
+          gpkg_file
+        )
+        
+        phu_data |>
+          sf::st_drop_geometry() |>
+          dplyr::transmute(
+            Source = phu_name,
+            SO_ASSOCIA =
+              as.character(
+                SO_ASSOCIA
+              ),
+            Included_in_DoA_peat =
+              matches_soil_association(
+                SO_ASSOCIA,
+                doa_peat_associations
+              ),
+            Included_in_SFD_peat =
+              matches_soil_association(
+                SO_ASSOCIA,
+                sfd_peat_associations
+              )
+          ) |>
+          dplyr::distinct()
+      },
+      error = function(e) {
+        
+        tibble::tibble(
+          Source = phu_name,
+          SO_ASSOCIA =
+            NA_character_,
+          Included_in_DoA_peat =
+            NA,
+          Included_in_SFD_peat =
+            NA
+        )
+      }
+    )
+  }
+)
+
+
+# ============================================================
+# 32. Statewide SO_ASSOCIA audit
+# ============================================================
+
+sabah_soil_audit <- sabah_peat |>
+  sf::st_drop_geometry() |>
+  dplyr::transmute(
+    Source =
+      "Sabah peat shapefile",
+    SO_ASSOCIA =
+      as.character(
+        SO_ASSOCIA
+      ),
+    Included_in_DoA_peat =
+      matches_soil_association(
+        SO_ASSOCIA,
+        doa_peat_associations
+      ),
+    Included_in_SFD_peat =
+      matches_soil_association(
+        SO_ASSOCIA,
+        sfd_peat_associations
+      )
+  ) |>
+  dplyr::distinct()
+
+
+soil_association_audit <- dplyr::bind_rows(
+  phu_soil_audit,
+  sabah_soil_audit
+) |>
+  dplyr::arrange(
+    Source,
+    SO_ASSOCIA
+  )
+
+
+# ============================================================
+# 33. Processing error table
+# ============================================================
+
+processing_errors <- results_formatted |>
+  dplyr::filter(
+    Extent_type ==
+      "Processing error"
+  )
+
+
+# ============================================================
+# 34. Output paths
+# ============================================================
+
+long_output_path <- file.path(
+  output_folder,
+  "PHU_and_Sabah_peat_area_by_forest_class_long.csv"
+)
+
+wide_output_path <- file.path(
+  output_folder,
+  "PHU_and_Sabah_peat_area_by_forest_class_wide.csv"
+)
+
+reserve_summary_output_path <- file.path(
+  output_folder,
+  "PHU_and_Sabah_peat_forest_reserve_summary.csv"
+)
+
+area_check_output_path <- file.path(
+  output_folder,
+  "forest_class_area_reconciliation_check.csv"
+)
+
+soil_audit_output_path <- file.path(
+  output_folder,
+  "SO_ASSOCIA_classification_audit.csv"
+)
+
+forest_class_audit_output_path <- file.path(
+  output_folder,
+  "FR_CLASS_audit.csv"
+)
+
+processing_errors_output_path <- file.path(
+  output_folder,
+  "processing_errors.csv"
+)
+
+
+# ============================================================
+# 35. Save outputs
+# ============================================================
+
+readr::write_csv(
+  results_formatted,
+  long_output_path,
+  na = ""
+)
+
+readr::write_csv(
+  results_wide,
+  wide_output_path,
+  na = ""
+)
+
+readr::write_csv(
+  reserve_summary,
+  reserve_summary_output_path,
+  na = ""
+)
+
+readr::write_csv(
+  area_reconciliation,
+  area_check_output_path,
+  na = ""
+)
+
+readr::write_csv(
+  soil_association_audit,
+  soil_audit_output_path,
+  na = ""
+)
+
+readr::write_csv(
+  forest_class_audit,
+  forest_class_audit_output_path,
+  na = ""
+)
+
+readr::write_csv(
+  processing_errors,
+  processing_errors_output_path,
+  na = ""
+)
+
+
+# ============================================================
+# 36. Print statewide Sabah results
+# ============================================================
+
+cat(
+  "\nStatewide Sabah peat results:\n\n"
+)
+
+print(
+  results_formatted |>
+    dplyr::filter(
+      Area_name == "Sabah"
+    ),
+  n = Inf
+)
+
+
+# ============================================================
+# 37. Print reconciliation problems
+# ============================================================
+
+reconciliation_problems <-
+  area_reconciliation |>
+  dplyr::filter(
+    Reconciliation_status !=
+      "OK"
+  )
+
+if (nrow(reconciliation_problems) > 0) {
+  
+  cat(
+    "\nArea-reconciliation issues detected:\n\n"
+  )
+  
+  print(
+    reconciliation_problems,
+    n = Inf
+  )
+  
+} else {
+  
+  cat(
+    "\nAll reported areas reconcile to within 1 hectare.\n"
+  )
+}
+
+
+# ============================================================
+# 38. Completion message
+# ============================================================
+
+cat(
+  "\nProcessing complete.\n\n",
+  "Long-format forest-class results:\n",
+  long_output_path,
+  "\n\n",
+  "Wide-format forest-class results:\n",
+  wide_output_path,
+  "\n\n",
+  "Forest-reserve summary:\n",
+  reserve_summary_output_path,
+  "\n\n",
+  "Area-reconciliation check:\n",
+  area_check_output_path,
+  "\n\n",
+  "SO_ASSOCIA classification audit:\n",
+  soil_audit_output_path,
+  "\n\n",
+  "FR_CLASS audit:\n",
+  forest_class_audit_output_path,
+  "\n\n",
+  "Processing errors:\n",
+  processing_errors_output_path,
+  "\n",
+  sep = ""
+)
