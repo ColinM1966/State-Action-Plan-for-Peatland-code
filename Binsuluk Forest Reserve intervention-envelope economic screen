@@ -1,0 +1,2159 @@
+# ============================================================
+# Binsuluk Forest Reserve intervention-envelope economic screen
+# No buffer, 150 m, 500 m and 1 km scenarios
+#
+# Peat mask:
+#   SO_ASSOCIA == "Klias" = peat
+#   SO_ASSOCIA == "Kinabatangan" or "Tuaran" = non-peat
+#
+# Intervention classes:
+#   - excluded infrastructure / built / river / road
+#   - BMP / controlled drainage candidate = oil palm on peat
+#   - low AGB restoration / fire-risk candidate
+#   - moderate AGB ANR / enrichment candidate
+#   - high AGB canopy-protection candidate
+#   - AGB unclassified restoration candidate
+#   - non-peat or unconfirmed
+# ============================================================
+
+# ------------------------------------------------------------
+# 1. Packages
+# ------------------------------------------------------------
+
+pkgs <- c(
+  "sf",
+  "terra",
+  "dplyr",
+  "tidyr",
+  "purrr",
+  "readr",
+  "stringr",
+  "tibble"
+)
+
+missing_pkgs <- pkgs[
+  !pkgs %in% rownames(installed.packages())
+]
+
+if (length(missing_pkgs) > 0) {
+  install.packages(missing_pkgs)
+}
+
+library(sf)
+library(terra)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(readr)
+library(stringr)
+library(tibble)
+
+sf_use_s2(FALSE)
+
+# ------------------------------------------------------------
+# 2. User settings
+# ------------------------------------------------------------
+
+cfg <- list(
+  out_dir = "C:/Users/User/Documents/Peatland/Outputs/Binsuluk_FR_CBA",
+  
+  # Equal-area CRS for area calculations
+  analysis_epsg = 6933,
+  
+  # Intervention envelopes around Binsuluk FR
+  buffer_dist_m = c(150, 500, 1000),
+  
+  # Add FR-only no-buffer scenario
+  include_no_buffer_scenario = TRUE,
+  
+  # TRUE = buffer areas outside the FR only.
+  # FALSE = buffer areas include the FR.
+  outside_fr_only = TRUE,
+  
+  # Exclusion buffers
+  road_exclusion_buffer_m = 15,
+  river_exclusion_buffer_m = 10,
+  
+  # AGB thresholds, Mg/ha
+  agb_low_threshold_mg_ha = 50,
+  agb_high_threshold_mg_ha = 150,
+  
+  # Drain-costing assumptions
+  drain_block_spacing_m = 250,
+  engineered_controls_per_km = 0.5,
+  
+  # Monitoring assumptions
+  piezometer_ha_per_station = 100,
+  min_piezometers_per_scenario = 5,
+  
+  # Restoration assumptions
+  enrichment_fraction = 0.30,
+  restoration_maintenance_years = 3,
+  
+  # Built-up raster rule:
+  # TRUE means any non-NA raster cell with value > 0 is treated as built-up.
+  builtup_positive_values_are_built = TRUE
+)
+
+dir.create(
+  cfg$out_dir,
+  showWarnings = FALSE,
+  recursive = TRUE
+)
+
+# ------------------------------------------------------------
+# 3. Input paths
+# ------------------------------------------------------------
+
+paths <- list(
+  forest_reserve = "C:/Users/User/Documents/Peatland/GIS/Casestudy/Binsuluk_case_study.gpkg",
+  
+  roads = "C:/Users/User/Documents/Peatland/GIS/PHU-road/Binsuluk_PHU-roads.gpkg",
+  
+  phu_extent = "C:/Users/User/Documents/Peatland/GIS/PHU-extent/Binsuluk_PHU.gpkg",
+  
+  cadastre = "C:/Users/User/Documents/Peatland/GIS/Cadestral_LandClass/Cadestral_Sabah_2017.gpkg",
+  
+  oilpalm = "C:/Users/User/Documents/Peatland/GIS/PHU-Peat-Extent_Shapefile/Binsulok_PHU-Oil_palm-Extent.shp",
+  
+  builtup = "C:/Users/User/Documents/Peatland/GIS/PHU_BuildArea/Binsuluk_PHU-BuildArea.tif",
+  
+  drains = "C:/Users/User/Documents/Peatland/GIS/PHU-drainage/Combined_PHU_drainage.gpkg",
+  
+  rivers = "E:/GIS_layers/Hydro/major river.shp",
+  
+  hotspots = "C:/Users/User/Documents/Peatland/GIS/Fire_stuff/firesPeatUTM50N.shp",
+  
+  agb = "C:/Users/User/Documents/Peatland/Biomassdata/CTree/Sabah_CTrees_AGB_2025_bbox.tif",
+  
+  agriculture = NA_character_
+)
+
+input_paths_tbl <- enframe(
+  unlist(paths),
+  name = "dataset",
+  value = "path"
+)
+
+write_csv(
+  input_paths_tbl,
+  file.path(cfg$out_dir, "input_paths_used.csv")
+)
+
+print(input_paths_tbl)
+
+# ------------------------------------------------------------
+# 4. Mandatory layer check
+# ------------------------------------------------------------
+
+mandatory <- c(
+  "forest_reserve",
+  "roads",
+  "phu_extent",
+  "cadastre",
+  "oilpalm",
+  "builtup",
+  "drains",
+  "rivers",
+  "hotspots",
+  "agb"
+)
+
+missing_mandatory <- mandatory[
+  is.na(unlist(paths[mandatory])) |
+    !file.exists(unlist(paths[mandatory]))
+]
+
+if (length(missing_mandatory) > 0) {
+  stop(
+    paste(
+      "Missing mandatory layer(s):",
+      paste(missing_mandatory, collapse = ", "),
+      "\nCheck the paths block."
+    )
+  )
+}
+
+# ------------------------------------------------------------
+# 5. Helper functions
+# ------------------------------------------------------------
+
+read_any_sf <- function(path, layer = NULL) {
+  
+  if (is.na(path) || !file.exists(path)) {
+    return(NULL)
+  }
+  
+  ext <- tolower(tools::file_ext(path))
+  
+  if (ext == "gpkg" && is.null(layer)) {
+    layer <- st_layers(path)$name[1]
+  }
+  
+  if (is.null(layer)) {
+    x <- st_read(path, quiet = TRUE)
+  } else {
+    x <- st_read(path, layer = layer, quiet = TRUE)
+  }
+  
+  x |>
+    st_zm(drop = TRUE, what = "ZM") |>
+    st_make_valid()
+}
+
+to_analysis_crs <- function(x) {
+  if (is.null(x)) {
+    return(NULL)
+  }
+  
+  st_transform(
+    x,
+    cfg$analysis_epsg
+  )
+}
+
+area_ha_vec <- function(x) {
+  as.numeric(st_area(x)) / 10000
+}
+
+add_area_ha <- function(x, area_col = "area_ha") {
+  
+  if (is.null(x) || nrow(x) == 0) {
+    return(x)
+  }
+  
+  x[[area_col]] <- as.numeric(
+    st_area(x)
+  ) / 10000
+  
+  x
+}
+
+area_ha <- function(g) {
+  if (is.null(g) || length(g) == 0 || all(st_is_empty(g))) {
+    return(0)
+  }
+  
+  sum(
+    as.numeric(st_area(g)),
+    na.rm = TRUE
+  ) / 10000
+}
+
+geom_is_empty <- function(g) {
+  is.null(g) ||
+    length(g) == 0 ||
+    all(st_is_empty(g))
+}
+
+to_poly_sfc <- function(g, crs) {
+  
+  if (geom_is_empty(g)) {
+    return(st_sfc(crs = crs))
+  }
+  
+  g <- suppressWarnings(
+    st_make_valid(g)
+  )
+  
+  g <- suppressWarnings(
+    st_collection_extract(
+      g,
+      "POLYGON",
+      warn = FALSE
+    )
+  )
+  
+  if (geom_is_empty(g)) {
+    return(st_sfc(crs = crs))
+  }
+  
+  g
+}
+
+safe_intersection <- function(a, b, crs) {
+  
+  a <- to_poly_sfc(a, crs)
+  b <- to_poly_sfc(b, crs)
+  
+  if (geom_is_empty(a) || geom_is_empty(b)) {
+    return(st_sfc(crs = crs))
+  }
+  
+  suppressWarnings(
+    st_intersection(a, b)
+  ) |>
+    to_poly_sfc(crs)
+}
+
+safe_difference <- function(a, b, crs) {
+  
+  a <- to_poly_sfc(a, crs)
+  
+  if (geom_is_empty(a)) {
+    return(a)
+  }
+  
+  b <- to_poly_sfc(b, crs)
+  
+  if (geom_is_empty(b)) {
+    return(a)
+  }
+  
+  suppressWarnings(
+    st_difference(a, b)
+  ) |>
+    to_poly_sfc(crs)
+}
+
+union_list <- function(g_list, crs) {
+  
+  g_list <- g_list[
+    map_lgl(
+      g_list,
+      ~ !geom_is_empty(.x)
+    )
+  ]
+  
+  if (length(g_list) == 0) {
+    return(
+      st_sfc(
+        st_geometrycollection(),
+        crs = crs
+      )
+    )
+  }
+  
+  suppressWarnings(
+    st_union(
+      do.call(c, g_list)
+    )
+  )
+}
+
+clip_layer <- function(x, boundary) {
+  
+  if (is.null(x)) {
+    return(NULL)
+  }
+  
+  x <- st_transform(
+    x,
+    st_crs(boundary)
+  )
+  
+  suppressWarnings(
+    st_filter(
+      x,
+      boundary,
+      .predicate = st_intersects
+    )
+  )
+}
+
+filter_text_any <- function(x, pattern) {
+  
+  dat <- st_drop_geometry(x)
+  
+  char_cols <- names(dat)[
+    map_lgl(
+      dat,
+      ~ is.character(.x) || is.factor(.x)
+    )
+  ]
+  
+  if (length(char_cols) == 0) {
+    return(x[0, ])
+  }
+  
+  hit <- rep(FALSE, nrow(x))
+  
+  for (cc in char_cols) {
+    hit <- hit |
+      str_detect(
+        as.character(dat[[cc]]),
+        regex(pattern, ignore_case = TRUE)
+      )
+  }
+  
+  x[hit, ]
+}
+
+layer_polygon_intersection <- function(layer, poly_g, crs) {
+  
+  if (is.null(layer) || geom_is_empty(poly_g)) {
+    return(st_sfc(crs = crs))
+  }
+  
+  poly_sf <- st_sf(
+    geometry = to_poly_sfc(poly_g, crs)
+  )
+  
+  x <- suppressWarnings(
+    st_intersection(
+      st_make_valid(layer),
+      poly_sf
+    )
+  )
+  
+  if (nrow(x) == 0) {
+    return(st_sfc(crs = crs))
+  }
+  
+  suppressWarnings(
+    st_union(st_geometry(x))
+  ) |>
+    to_poly_sfc(crs)
+}
+
+line_buffer_intersection <- function(layer, poly_g, buffer_m, crs) {
+  
+  if (is.null(layer) || geom_is_empty(poly_g)) {
+    return(st_sfc(crs = crs))
+  }
+  
+  poly_sf <- st_sf(
+    geometry = to_poly_sfc(poly_g, crs)
+  )
+  
+  x <- suppressWarnings(
+    st_intersection(layer, poly_sf)
+  )
+  
+  if (nrow(x) == 0) {
+    return(st_sfc(crs = crs))
+  }
+  
+  suppressWarnings(
+    st_buffer(x, buffer_m)
+  ) |>
+    st_geometry() |>
+    st_union() |>
+    to_poly_sfc(crs)
+}
+
+line_length_km <- function(lines, poly_g) {
+  
+  if (is.null(lines) || geom_is_empty(poly_g)) {
+    return(0)
+  }
+  
+  poly_sf <- st_sf(
+    geometry = poly_g
+  )
+  
+  x <- suppressWarnings(
+    st_intersection(lines, poly_sf)
+  )
+  
+  if (nrow(x) == 0) {
+    return(0)
+  }
+  
+  sum(
+    as.numeric(st_length(x)),
+    na.rm = TRUE
+  ) / 1000
+}
+
+point_count <- function(points, poly_g) {
+  
+  if (is.null(points) || geom_is_empty(poly_g)) {
+    return(NA_integer_)
+  }
+  
+  poly_sf <- st_sf(
+    geometry = poly_g
+  )
+  
+  length(
+    which(
+      lengths(
+        st_intersects(points, poly_sf)
+      ) > 0
+    )
+  )
+}
+
+geom_to_class_sf <- function(
+    g,
+    scenario_type,
+    scenario,
+    buffer_m,
+    ring,
+    intervention_class,
+    crs
+) {
+  
+  g <- to_poly_sfc(g, crs)
+  
+  if (geom_is_empty(g)) {
+    return(NULL)
+  }
+  
+  st_sf(
+    scenario_type = scenario_type,
+    scenario = scenario,
+    buffer_m = buffer_m,
+    ring = ring,
+    intervention_class = intervention_class,
+    geometry = g
+  )
+}
+
+# ------------------------------------------------------------
+# 6. Raster helper functions
+# ------------------------------------------------------------
+
+read_builtup_raster_as_sf <- function(path, boundary_sf) {
+  
+  if (is.na(path) || !file.exists(path)) {
+    return(NULL)
+  }
+  
+  r <- rast(path)
+  
+  boundary_vect <- vect(
+    st_transform(boundary_sf, crs(r))
+  )
+  
+  r_crop <- crop(
+    r,
+    boundary_vect
+  )
+  
+  r_mask <- mask(
+    r_crop,
+    boundary_vect
+  )
+  
+  if (cfg$builtup_positive_values_are_built) {
+    
+    r_built <- ifel(
+      !is.na(r_mask) & r_mask > 0,
+      1,
+      NA
+    )
+    
+  } else {
+    
+    r_built <- ifel(
+      !is.na(r_mask),
+      1,
+      NA
+    )
+  }
+  
+  names(r_built) <- "builtup"
+  
+  p <- as.polygons(
+    r_built,
+    dissolve = TRUE,
+    na.rm = TRUE
+  )
+  
+  if (is.null(p) || nrow(p) == 0) {
+    return(NULL)
+  }
+  
+  st_as_sf(p) |>
+    st_make_valid() |>
+    st_transform(cfg$analysis_epsg)
+}
+
+read_agb_raster_as_classes <- function(path, boundary_sf) {
+  
+  if (is.na(path) || !file.exists(path)) {
+    stop("AGB raster path is missing or does not exist.")
+  }
+  
+  r <- rast(path)
+  
+  boundary_vect <- vect(
+    st_transform(
+      boundary_sf,
+      crs(r)
+    )
+  )
+  
+  r_crop <- crop(
+    r,
+    boundary_vect
+  )
+  
+  r_mask <- mask(
+    r_crop,
+    boundary_vect
+  )
+  
+  r_mask <- ifel(
+    r_mask < 0,
+    NA,
+    r_mask
+  )
+  
+  r_class <- classify(
+    r_mask,
+    rcl = matrix(
+      c(
+        -1e12, cfg$agb_low_threshold_mg_ha, 1,
+        cfg$agb_low_threshold_mg_ha, cfg$agb_high_threshold_mg_ha, 2,
+        cfg$agb_high_threshold_mg_ha, 1e12, 3
+      ),
+      ncol = 3,
+      byrow = TRUE
+    ),
+    include.lowest = TRUE,
+    right = FALSE
+  )
+  
+  names(r_class) <- "agb_class_id"
+  
+  p <- as.polygons(
+    r_class,
+    dissolve = TRUE,
+    na.rm = TRUE
+  )
+  
+  if (is.null(p) || nrow(p) == 0) {
+    stop("AGB raster produced no polygons after crop/mask.")
+  }
+  
+  agb_sf <- st_as_sf(p) |>
+    st_make_valid() |>
+    st_transform(cfg$analysis_epsg) |>
+    mutate(
+      agb_class_id = as.integer(agb_class_id),
+      agb_class = case_when(
+        agb_class_id == 1 ~ "low_AGB_restoration_fire_risk_candidate",
+        agb_class_id == 2 ~ "moderate_AGB_ANR_enrichment_candidate",
+        agb_class_id == 3 ~ "high_AGB_canopy_protection_candidate",
+        TRUE ~ "AGB_unclassified_restoration_candidate"
+      )
+    )
+  
+  agb_sf
+}
+
+# ------------------------------------------------------------
+# 7. Read vector layers
+# ------------------------------------------------------------
+
+fr_raw <- read_any_sf(paths$forest_reserve) |>
+  to_analysis_crs()
+
+phu_raw <- read_any_sf(paths$phu_extent) |>
+  to_analysis_crs()
+
+roads <- read_any_sf(paths$roads) |>
+  to_analysis_crs()
+
+cadastre <- read_any_sf(paths$cadastre) |>
+  to_analysis_crs()
+
+oilpalm <- read_any_sf(paths$oilpalm) |>
+  to_analysis_crs()
+
+drains <- read_any_sf(paths$drains) |>
+  to_analysis_crs()
+
+rivers <- read_any_sf(paths$rivers) |>
+  to_analysis_crs()
+
+hotspots <- read_any_sf(paths$hotspots) |>
+  to_analysis_crs()
+
+agriculture <- read_any_sf(paths$agriculture) |>
+  to_analysis_crs()
+
+# ------------------------------------------------------------
+# 8. Build Binsuluk FR, PHU boundary and peat mask
+# ------------------------------------------------------------
+
+fr_test <- filter_text_any(
+  fr_raw,
+  "binsuluk|binsulok"
+)
+
+if (nrow(fr_test) > 0) {
+  fr_raw <- fr_test
+}
+
+binsuluk_fr <- st_sf(
+  name = "Binsuluk_FR",
+  geometry = st_union(
+    st_geometry(fr_raw)
+  )
+)
+
+binsuluk_phu <- st_sf(
+  name = "Binsuluk_PHU",
+  geometry = st_union(
+    st_geometry(phu_raw)
+  )
+)
+
+if (!"SO_ASSOCIA" %in% names(phu_raw)) {
+  stop("The PHU extent layer does not contain SO_ASSOCIA.")
+}
+
+peat_mask_raw <- phu_raw |>
+  mutate(
+    SO_ASSOCIA_clean = str_to_upper(
+      str_trim(
+        as.character(SO_ASSOCIA)
+      )
+    )
+  ) |>
+  filter(
+    SO_ASSOCIA_clean == "KLIAS"
+  ) |>
+  st_make_valid()
+
+if (nrow(peat_mask_raw) == 0) {
+  stop("No Klias peat polygons found in SO_ASSOCIA.")
+}
+
+nonpeat_mask_raw <- phu_raw |>
+  mutate(
+    SO_ASSOCIA_clean = str_to_upper(
+      str_trim(
+        as.character(SO_ASSOCIA)
+      )
+    )
+  ) |>
+  filter(
+    SO_ASSOCIA_clean %in% c(
+      "KINABATANGAN",
+      "TUARAN"
+    )
+  ) |>
+  st_make_valid()
+
+peat_mask <- st_sf(
+  peat_class = "Klias_peat",
+  geometry = st_union(
+    st_geometry(peat_mask_raw)
+  )
+)
+
+if (nrow(nonpeat_mask_raw) > 0) {
+  
+  nonpeat_mask <- st_sf(
+    peat_class = "Non_peat_Kinabatangan_Tuaran",
+    geometry = st_union(
+      st_geometry(nonpeat_mask_raw)
+    )
+  )
+  
+} else {
+  
+  nonpeat_mask <- NULL
+}
+
+# ------------------------------------------------------------
+# 9. Create preliminary study extent and read raster layers
+# ------------------------------------------------------------
+
+study_extent_pre <- st_sf(
+  geometry = safe_intersection(
+    st_buffer(
+      st_union(
+        st_geometry(binsuluk_fr)
+      ),
+      max(cfg$buffer_dist_m)
+    ),
+    st_union(
+      st_geometry(binsuluk_phu)
+    ),
+    st_crs(binsuluk_fr)
+  )
+)
+
+builtup <- read_builtup_raster_as_sf(
+  paths$builtup,
+  study_extent_pre
+)
+
+agb_classes <- read_agb_raster_as_classes(
+  paths$agb,
+  study_extent_pre
+)
+
+agb_low <- agb_classes |>
+  filter(
+    agb_class == "low_AGB_restoration_fire_risk_candidate"
+  )
+
+agb_moderate <- agb_classes |>
+  filter(
+    agb_class == "moderate_AGB_ANR_enrichment_candidate"
+  )
+
+agb_high <- agb_classes |>
+  filter(
+    agb_class == "high_AGB_canopy_protection_candidate"
+  )
+
+# ------------------------------------------------------------
+# 10. Clip layers to study extent
+# ------------------------------------------------------------
+
+study_extent <- study_extent_pre
+
+roads <- clip_layer(roads, study_extent)
+cadastre <- clip_layer(cadastre, study_extent)
+oilpalm <- clip_layer(oilpalm, study_extent)
+drains <- clip_layer(drains, study_extent)
+rivers <- clip_layer(rivers, study_extent)
+hotspots <- clip_layer(hotspots, study_extent)
+agriculture <- clip_layer(agriculture, study_extent)
+builtup <- clip_layer(builtup, study_extent)
+
+agb_classes <- clip_layer(agb_classes, study_extent)
+agb_low <- clip_layer(agb_low, study_extent)
+agb_moderate <- clip_layer(agb_moderate, study_extent)
+agb_high <- clip_layer(agb_high, study_extent)
+
+# ------------------------------------------------------------
+# 11. Cadastral title grouping
+# ------------------------------------------------------------
+
+if (!"title_type" %in% names(cadastre)) {
+  stop("The cadastral layer does not contain title_type.")
+}
+
+cadastre <- cadastre |>
+  mutate(
+    title_type_raw = as.character(title_type),
+    title_type_clean = str_to_upper(
+      str_trim(title_type_raw)
+    ),
+    title_group = case_when(
+      is.na(title_type_clean) |
+        title_type_clean == "" |
+        title_type_clean == "NULL" ~ "Title_category_not_recorded",
+      
+      title_type_clean %in% c(
+        "CL",
+        "PL",
+        "TL"
+      ) ~ "Alienated_private",
+      
+      title_type_clean == "NT" ~ "Native_Title",
+      
+      title_type_clean == "FR" ~ "Forest_Reserve_or_residual",
+      
+      TRUE ~ paste0(
+        "Other_",
+        title_type_clean
+      )
+    )
+  )
+
+# ------------------------------------------------------------
+# 12. Create no-buffer scenario, cumulative buffers and rings
+# ------------------------------------------------------------
+
+make_buffers <- function(
+    fr,
+    phu,
+    distances,
+    outside_only = TRUE,
+    include_no_buffer = TRUE
+) {
+  
+  crs <- st_crs(fr)
+  
+  fr_g <- st_union(
+    st_geometry(fr)
+  )
+  
+  phu_g <- st_union(
+    st_geometry(phu)
+  )
+  
+  cumulative_list <- list()
+  ring_list <- list()
+  
+  if (include_no_buffer) {
+    
+    fr_only_g <- safe_intersection(
+      fr_g,
+      phu_g,
+      crs
+    )
+    
+    cumulative_list[["FR_only_no_buffer"]] <- st_sf(
+      scenario_type = "no_buffer",
+      scenario = "FR_only_no_buffer",
+      buffer_m = 0,
+      ring = "FR_only",
+      geometry = fr_only_g
+    )
+  }
+  
+  previous_d <- 0
+  
+  for (d in distances) {
+    
+    outer_g <- st_buffer(
+      fr_g,
+      d
+    )
+    
+    if (outside_only) {
+      
+      cumulative_g <- safe_difference(
+        outer_g,
+        fr_g,
+        crs
+      )
+      
+    } else {
+      
+      cumulative_g <- outer_g
+    }
+    
+    cumulative_g <- safe_intersection(
+      cumulative_g,
+      phu_g,
+      crs
+    )
+    
+    cumulative_list[[as.character(d)]] <- st_sf(
+      scenario_type = "cumulative_buffer",
+      scenario = paste0(
+        "0-",
+        d,
+        "m_buffer"
+      ),
+      buffer_m = d,
+      ring = paste0(
+        "0-",
+        d,
+        "m"
+      ),
+      geometry = cumulative_g
+    )
+    
+    inner_g <- if (previous_d == 0) {
+      
+      if (outside_only) {
+        
+        fr_g
+        
+      } else {
+        
+        st_sfc(
+          st_geometrycollection(),
+          crs = crs
+        )
+      }
+      
+    } else {
+      
+      st_buffer(
+        fr_g,
+        previous_d
+      )
+    }
+    
+    ring_g <- safe_difference(
+      outer_g,
+      inner_g,
+      crs
+    )
+    
+    ring_g <- safe_intersection(
+      ring_g,
+      phu_g,
+      crs
+    )
+    
+    ring_list[[as.character(d)]] <- st_sf(
+      scenario_type = "buffer_ring",
+      scenario = paste0(
+        previous_d,
+        "-",
+        d,
+        "m_ring"
+      ),
+      buffer_m = d,
+      ring = paste0(
+        previous_d,
+        "-",
+        d,
+        "m"
+      ),
+      geometry = ring_g
+    )
+    
+    previous_d <- d
+  }
+  
+  list(
+    cumulative = bind_rows(cumulative_list),
+    rings = bind_rows(ring_list)
+  )
+}
+
+buffers <- make_buffers(
+  fr = binsuluk_fr,
+  phu = binsuluk_phu,
+  distances = cfg$buffer_dist_m,
+  outside_only = cfg$outside_fr_only,
+  include_no_buffer = cfg$include_no_buffer_scenario
+)
+
+collapse_sf_by_scenario <- function(x) {
+  
+  x |>
+    group_by(
+      scenario_type,
+      scenario,
+      buffer_m,
+      ring
+    ) |>
+    summarise(
+      .groups = "drop",
+      do_union = TRUE
+    ) |>
+    st_make_valid() |>
+    add_area_ha(
+      area_col = "gross_area_ha"
+    )
+}
+
+buffers_cumulative <- collapse_sf_by_scenario(
+  buffers$cumulative
+)
+
+buffer_rings <- collapse_sf_by_scenario(
+  buffers$rings
+)
+
+all_buffers <- bind_rows(
+  buffers_cumulative,
+  buffer_rings
+)
+
+write_csv(
+  buffers_cumulative |>
+    st_drop_geometry(),
+  file.path(cfg$out_dir, "buffers_cumulative_area_summary.csv")
+)
+
+write_csv(
+  buffer_rings |>
+    st_drop_geometry(),
+  file.path(cfg$out_dir, "buffer_rings_area_summary.csv")
+)
+
+# ------------------------------------------------------------
+# 13. Overlap summary
+# ------------------------------------------------------------
+
+summarise_overlap_area <- function(base, overlay, overlay_name) {
+  
+  if (is.null(overlay) || nrow(overlay) == 0) {
+    return(tibble())
+  }
+  
+  overlay_g <- st_union(
+    st_geometry(overlay)
+  )
+  
+  x <- suppressWarnings(
+    st_intersection(
+      base,
+      overlay_g
+    )
+  )
+  
+  if (nrow(x) == 0) {
+    return(tibble())
+  }
+  
+  x <- x |>
+    add_area_ha(
+      area_col = "area_ha"
+    )
+  
+  x |>
+    st_drop_geometry() |>
+    group_by(
+      scenario_type,
+      scenario,
+      buffer_m,
+      ring
+    ) |>
+    summarise(
+      area_ha = sum(
+        area_ha,
+        na.rm = TRUE
+      ),
+      .groups = "drop"
+    ) |>
+    mutate(
+      layer = overlay_name
+    )
+}
+
+overlap_summary <- bind_rows(
+  summarise_overlap_area(
+    all_buffers,
+    peat_mask,
+    "Klias_peat"
+  ),
+  summarise_overlap_area(
+    all_buffers,
+    nonpeat_mask,
+    "Non_peat_Kinabatangan_Tuaran"
+  ),
+  summarise_overlap_area(
+    all_buffers,
+    oilpalm,
+    "Oil_palm"
+  ),
+  summarise_overlap_area(
+    all_buffers,
+    builtup,
+    "Built_up"
+  ),
+  summarise_overlap_area(
+    all_buffers,
+    agb_low,
+    "AGB_low_less_than_50_Mg_ha"
+  ),
+  summarise_overlap_area(
+    all_buffers,
+    agb_moderate,
+    "AGB_moderate_50_to_150_Mg_ha"
+  ),
+  summarise_overlap_area(
+    all_buffers,
+    agb_high,
+    "AGB_high_greater_than_150_Mg_ha"
+  )
+)
+
+write_csv(
+  overlap_summary,
+  file.path(cfg$out_dir, "buffer_overlap_area_summary.csv")
+)
+
+# ------------------------------------------------------------
+# 14. Broad tenure summary by buffer
+# SAFE VERSION - no if_else() size error
+# ------------------------------------------------------------
+
+summarise_titles_one <- function(buffer_one) {
+  
+  crs <- st_crs(buffer_one)
+  
+  buffer_g <- st_union(
+    st_geometry(buffer_one)
+  )
+  
+  buffer_area_ha <- area_ha(buffer_g)
+  
+  x <- suppressWarnings(
+    st_intersection(
+      cadastre,
+      buffer_one
+    )
+  )
+  
+  if (nrow(x) > 0) {
+    
+    x <- suppressWarnings(
+      st_collection_extract(
+        st_make_valid(x),
+        "POLYGON",
+        warn = FALSE
+      )
+    )
+    
+    if (nrow(x) > 0) {
+      
+      x <- x |>
+        add_area_ha(
+          area_col = "area_ha"
+        )
+      
+      title_area <- x |>
+        st_drop_geometry() |>
+        group_by(title_group) |>
+        summarise(
+          area_ha = sum(
+            area_ha,
+            na.rm = TRUE
+          ),
+          .groups = "drop"
+        )
+      
+      cad_g <- st_union(
+        st_geometry(x)
+      )
+      
+      residual_g <- safe_difference(
+        buffer_g,
+        cad_g,
+        crs
+      )
+      
+      residual_area_ha <- area_ha(
+        residual_g
+      )
+      
+    } else {
+      
+      title_area <- tibble(
+        title_group = character(),
+        area_ha = numeric()
+      )
+      
+      residual_area_ha <- buffer_area_ha
+    }
+    
+  } else {
+    
+    title_area <- tibble(
+      title_group = character(),
+      area_ha = numeric()
+    )
+    
+    residual_area_ha <- buffer_area_ha
+  }
+  
+  if (residual_area_ha > 0.001) {
+    
+    title_area <- bind_rows(
+      title_area,
+      tibble(
+        title_group = "Forest_Reserve_or_residual",
+        area_ha = residual_area_ha
+      )
+    ) |>
+      group_by(title_group) |>
+      summarise(
+        area_ha = sum(
+          area_ha,
+          na.rm = TRUE
+        ),
+        .groups = "drop"
+      )
+  }
+  
+  if (nrow(title_area) == 0) {
+    
+    title_area <- tibble(
+      title_group = "No_cadastral_overlap",
+      area_ha = 0
+    )
+  }
+  
+  # Do percentage outside mutate() so there is no dplyr size mismatch
+  if (buffer_area_ha > 0) {
+    title_area$pct_of_buffer <- 100 * title_area$area_ha / buffer_area_ha
+  } else {
+    title_area$pct_of_buffer <- NA_real_
+  }
+  
+  title_area |>
+    mutate(
+      scenario_type = buffer_one$scenario_type[1],
+      scenario = buffer_one$scenario[1],
+      buffer_m = buffer_one$buffer_m[1],
+      ring = buffer_one$ring[1],
+      buffer_area_ha = buffer_area_ha
+    ) |>
+    select(
+      scenario_type,
+      scenario,
+      buffer_m,
+      ring,
+      buffer_area_ha,
+      title_group,
+      area_ha,
+      pct_of_buffer
+    )
+}
+
+# Check that the old if_else line is gone from the active function
+any(
+  grepl(
+    "if_else",
+    deparse(body(summarise_titles_one))
+  )
+)
+
+# This should return FALSE
+title_summary <- map_dfr(
+  seq_len(nrow(all_buffers)),
+  ~ summarise_titles_one(all_buffers[.x, ])
+)
+
+title_summary_wide <- title_summary |>
+  select(
+    scenario_type,
+    scenario,
+    buffer_m,
+    ring,
+    buffer_area_ha,
+    title_group,
+    area_ha
+  ) |>
+  pivot_wider(
+    names_from = title_group,
+    values_from = area_ha,
+    values_fill = 0,
+    names_prefix = "area_ha_"
+  )
+
+write_csv(
+  title_summary,
+  file.path(cfg$out_dir, "buffer_title_summary_broad_groups_long.csv")
+)
+
+write_csv(
+  title_summary_wide,
+  file.path(cfg$out_dir, "buffer_title_summary_broad_groups_wide.csv")
+)
+
+# ------------------------------------------------------------
+# 15. Intervention classification
+# ------------------------------------------------------------
+
+classify_scenario <- function(buffer_one) {
+  
+  crs <- st_crs(buffer_one)
+  
+  scenario_type <- buffer_one$scenario_type[1]
+  scenario <- buffer_one$scenario[1]
+  buffer_m <- buffer_one$buffer_m[1]
+  ring <- buffer_one$ring[1]
+  
+  scen_g <- st_union(
+    st_geometry(buffer_one)
+  )
+  
+  peat_g <- layer_polygon_intersection(
+    peat_mask,
+    scen_g,
+    crs
+  )
+  
+  road_excl_g <- line_buffer_intersection(
+    roads,
+    scen_g,
+    cfg$road_exclusion_buffer_m,
+    crs
+  )
+  
+  river_excl_g <- line_buffer_intersection(
+    rivers,
+    scen_g,
+    cfg$river_exclusion_buffer_m,
+    crs
+  )
+  
+  built_g <- layer_polygon_intersection(
+    builtup,
+    scen_g,
+    crs
+  )
+  
+  exclusion_g <- union_list(
+    list(
+      road_excl_g,
+      river_excl_g,
+      built_g
+    ),
+    crs
+  )
+  
+  peat_no_excl_g <- safe_difference(
+    peat_g,
+    exclusion_g,
+    crs
+  )
+  
+  oilpalm_g <- layer_polygon_intersection(
+    oilpalm,
+    peat_no_excl_g,
+    crs
+  )
+  
+  agriculture_g <- layer_polygon_intersection(
+    agriculture,
+    peat_no_excl_g,
+    crs
+  )
+  
+  bmp_g <- union_list(
+    list(
+      oilpalm_g,
+      agriculture_g
+    ),
+    crs
+  )
+  
+  hydro_g <- safe_difference(
+    peat_no_excl_g,
+    bmp_g,
+    crs
+  )
+  
+  low_agb_g <- layer_polygon_intersection(
+    agb_low,
+    hydro_g,
+    crs
+  )
+  
+  moderate_agb_g <- layer_polygon_intersection(
+    agb_moderate,
+    hydro_g,
+    crs
+  )
+  
+  high_agb_g <- layer_polygon_intersection(
+    agb_high,
+    hydro_g,
+    crs
+  )
+  
+  agb_classified_g <- union_list(
+    list(
+      low_agb_g,
+      moderate_agb_g,
+      high_agb_g
+    ),
+    crs
+  )
+  
+  agb_unclassified_g <- safe_difference(
+    hydro_g,
+    agb_classified_g,
+    crs
+  )
+  
+  nonpeat_g <- safe_difference(
+    scen_g,
+    union_list(
+      list(
+        peat_g,
+        exclusion_g
+      ),
+      crs
+    ),
+    crs
+  )
+  
+  class_sf <- bind_rows(
+    geom_to_class_sf(
+      exclusion_g,
+      scenario_type,
+      scenario,
+      buffer_m,
+      ring,
+      "excluded_infrastructure_built_river_road",
+      crs
+    ),
+    geom_to_class_sf(
+      bmp_g,
+      scenario_type,
+      scenario,
+      buffer_m,
+      ring,
+      "bmp_controlled_drainage_candidate",
+      crs
+    ),
+    geom_to_class_sf(
+      low_agb_g,
+      scenario_type,
+      scenario,
+      buffer_m,
+      ring,
+      "low_AGB_restoration_fire_risk_candidate",
+      crs
+    ),
+    geom_to_class_sf(
+      moderate_agb_g,
+      scenario_type,
+      scenario,
+      buffer_m,
+      ring,
+      "moderate_AGB_ANR_enrichment_candidate",
+      crs
+    ),
+    geom_to_class_sf(
+      high_agb_g,
+      scenario_type,
+      scenario,
+      buffer_m,
+      ring,
+      "high_AGB_canopy_protection_candidate",
+      crs
+    ),
+    geom_to_class_sf(
+      agb_unclassified_g,
+      scenario_type,
+      scenario,
+      buffer_m,
+      ring,
+      "AGB_unclassified_restoration_candidate",
+      crs
+    ),
+    geom_to_class_sf(
+      nonpeat_g,
+      scenario_type,
+      scenario,
+      buffer_m,
+      ring,
+      "non_peat_or_unconfirmed",
+      crs
+    )
+  )
+  
+  if (nrow(class_sf) > 0) {
+    class_sf <- class_sf |>
+      add_area_ha(
+        area_col = "area_ha"
+      )
+  }
+  
+  intervention_g <- union_list(
+    list(
+      bmp_g,
+      low_agb_g,
+      moderate_agb_g,
+      high_agb_g,
+      agb_unclassified_g
+    ),
+    crs
+  )
+  
+  drain_all_km <- line_length_km(
+    drains,
+    scen_g
+  )
+  
+  drain_intervention_km <- line_length_km(
+    drains,
+    intervention_g
+  )
+  
+  hotspot_n <- point_count(
+    hotspots,
+    peat_no_excl_g
+  )
+  
+  drain_tbl <- tibble(
+    scenario_type = scenario_type,
+    scenario = scenario,
+    buffer_m = buffer_m,
+    ring = ring,
+    drain_all_km = drain_all_km,
+    drain_intervention_km = drain_intervention_km,
+    hotspot_count_on_eligible_peat = hotspot_n,
+    peat_area_ha = area_ha(peat_g),
+    eligible_peat_area_ha = area_ha(peat_no_excl_g),
+    fire_prevention_area_ha = area_ha(peat_no_excl_g)
+  )
+  
+  list(
+    class_sf = class_sf,
+    drain_tbl = drain_tbl
+  )
+}
+
+classification_results <- map(
+  seq_len(nrow(buffers_cumulative)),
+  ~ classify_scenario(buffers_cumulative[.x, ])
+)
+
+intervention_classes <- bind_rows(
+  map(classification_results, "class_sf")
+)
+
+drain_summary <- bind_rows(
+  map(classification_results, "drain_tbl")
+)
+
+class_area_summary <- intervention_classes |>
+  st_drop_geometry() |>
+  group_by(
+    scenario_type,
+    scenario,
+    buffer_m,
+    ring,
+    intervention_class
+  ) |>
+  summarise(
+    area_ha = sum(
+      area_ha,
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  )
+
+write_csv(
+  class_area_summary,
+  file.path(cfg$out_dir, "intervention_class_area_summary.csv")
+)
+
+write_csv(
+  drain_summary,
+  file.path(cfg$out_dir, "drain_hotspot_summary.csv")
+)
+
+# ------------------------------------------------------------
+# 16. Economic assumptions
+# ------------------------------------------------------------
+
+assumptions <- tribble(
+  ~assumption_case,
+  ~simple_drain_block_rm,
+  ~engineered_water_control_rm,
+  ~drain_assessment_rm_per_km,
+  ~drain_minor_works_rm_per_km,
+  ~manual_piezometer_install_rm,
+  ~manual_piezometer_monitoring_rm_per_year,
+  ~anr_rm_per_ha,
+  ~enrichment_planting_rm_per_ha,
+  ~maintenance_rm_per_ha_per_year,
+  ~fire_prevention_rm_per_ha_per_year,
+  ~engagement_rm_per_project,
+  ~monitoring_reporting_rm_per_year,
+  ~carbon_rm_per_tco2e,
+  ~baseline_drained_oil_palm_tco2e_ha_yr,
+  ~baseline_degraded_drained_peat_tco2e_ha_yr,
+  ~bmp_reduction_factor,
+  ~low_agb_reduction_factor,
+  ~moderate_agb_reduction_factor,
+  ~high_agb_reduction_factor,
+  ~unclassified_agb_reduction_factor,
+  ~discount_rate,
+  ~time_horizon_years,
+  
+  "low",
+  5000,
+  20000,
+  500,
+  2000,
+  800,
+  600,
+  1500,
+  5000,
+  500,
+  20,
+  20000,
+  25000,
+  25,
+  20,
+  30,
+  0.10,
+  0.25,
+  0.20,
+  0.10,
+  0.20,
+  0.03,
+  10,
+  
+  "base",
+  10000,
+  35000,
+  1200,
+  5000,
+  1500,
+  1500,
+  3000,
+  8000,
+  1000,
+  50,
+  50000,
+  60000,
+  50,
+  40,
+  50,
+  0.20,
+  0.50,
+  0.35,
+  0.20,
+  0.35,
+  0.05,
+  10,
+  
+  "high",
+  20000,
+  75000,
+  2500,
+  10000,
+  3000,
+  3000,
+  5000,
+  15000,
+  2000,
+  100,
+  100000,
+  120000,
+  100,
+  62,
+  70,
+  0.30,
+  0.65,
+  0.50,
+  0.30,
+  0.50,
+  0.08,
+  10
+)
+
+write_csv(
+  assumptions,
+  file.path(cfg$out_dir, "economic_assumptions.csv")
+)
+
+pv_annuity <- function(r, n) {
+  ifelse(
+    r == 0,
+    n,
+    (1 - (1 + r)^(-n)) / r
+  )
+}
+
+pv_limited_years <- function(r, n_years) {
+  map2_dbl(
+    r,
+    n_years,
+    ~ sum(
+      1 / (1 + .x)^(1:.y)
+    )
+  )
+}
+
+# ------------------------------------------------------------
+# 17. Cost-benefit calculations
+# ------------------------------------------------------------
+
+area_wide <- class_area_summary |>
+  filter(
+    scenario_type %in% c(
+      "no_buffer",
+      "cumulative_buffer"
+    )
+  ) |>
+  select(
+    scenario_type,
+    scenario,
+    buffer_m,
+    ring,
+    intervention_class,
+    area_ha
+  ) |>
+  pivot_wider(
+    names_from = intervention_class,
+    values_from = area_ha,
+    values_fill = 0
+  )
+
+needed_cols <- c(
+  "excluded_infrastructure_built_river_road",
+  "bmp_controlled_drainage_candidate",
+  "low_AGB_restoration_fire_risk_candidate",
+  "moderate_AGB_ANR_enrichment_candidate",
+  "high_AGB_canopy_protection_candidate",
+  "AGB_unclassified_restoration_candidate",
+  "non_peat_or_unconfirmed"
+)
+
+for (nm in needed_cols) {
+  if (!nm %in% names(area_wide)) {
+    area_wide[[nm]] <- 0
+  }
+}
+
+area_for_econ <- area_wide |>
+  left_join(
+    drain_summary,
+    by = c(
+      "scenario_type",
+      "scenario",
+      "buffer_m",
+      "ring"
+    )
+  ) |>
+  mutate(
+    treated_area_ha =
+      bmp_controlled_drainage_candidate +
+      low_AGB_restoration_fire_risk_candidate +
+      moderate_AGB_ANR_enrichment_candidate +
+      high_AGB_canopy_protection_candidate +
+      AGB_unclassified_restoration_candidate,
+    
+    active_restoration_area_ha =
+      low_AGB_restoration_fire_risk_candidate +
+      moderate_AGB_ANR_enrichment_candidate +
+      AGB_unclassified_restoration_candidate,
+    
+    canopy_protection_area_ha =
+      high_AGB_canopy_protection_candidate,
+    
+    fire_prevention_area_ha = if_else(
+      is.na(fire_prevention_area_ha),
+      treated_area_ha,
+      fire_prevention_area_ha
+    )
+  )
+
+econ_summary <- tidyr::crossing(
+  area_for_econ,
+  assumptions
+) |>
+  mutate(
+    drain_km_for_cost = if_else(
+      !is.na(drain_intervention_km) &
+        drain_intervention_km > 0,
+      drain_intervention_km,
+      0
+    ),
+    
+    simple_drain_blocks_n = if_else(
+      drain_km_for_cost > 0,
+      ceiling(
+        drain_km_for_cost * 1000 /
+          cfg$drain_block_spacing_m
+      ),
+      0
+    ),
+    
+    engineered_controls_n = if_else(
+      drain_km_for_cost > 0,
+      ceiling(
+        drain_km_for_cost *
+          cfg$engineered_controls_per_km
+      ),
+      0
+    ),
+    
+    piezometers_n = if_else(
+      treated_area_ha > 0,
+      pmax(
+        cfg$min_piezometers_per_scenario,
+        ceiling(
+          treated_area_ha /
+            cfg$piezometer_ha_per_station
+        )
+      ),
+      0
+    ),
+    
+    pv_factor = pv_annuity(
+      discount_rate,
+      time_horizon_years
+    ),
+    
+    pv_maintenance_factor = pv_limited_years(
+      discount_rate,
+      pmin(
+        cfg$restoration_maintenance_years,
+        time_horizon_years
+      )
+    ),
+    
+    restoration_establishment_rm =
+      low_AGB_restoration_fire_risk_candidate *
+      enrichment_planting_rm_per_ha +
+      moderate_AGB_ANR_enrichment_candidate *
+      (
+        (1 - cfg$enrichment_fraction) *
+          anr_rm_per_ha +
+          cfg$enrichment_fraction *
+          enrichment_planting_rm_per_ha
+      ) +
+      AGB_unclassified_restoration_candidate *
+      (
+        (1 - cfg$enrichment_fraction) *
+          anr_rm_per_ha +
+          cfg$enrichment_fraction *
+          enrichment_planting_rm_per_ha
+      ),
+    
+    drain_assessment_rm =
+      drain_km_for_cost *
+      drain_assessment_rm_per_km,
+    
+    drain_minor_works_rm =
+      drain_km_for_cost *
+      drain_minor_works_rm_per_km,
+    
+    simple_drain_blocks_rm =
+      simple_drain_blocks_n *
+      simple_drain_block_rm,
+    
+    engineered_controls_rm =
+      engineered_controls_n *
+      engineered_water_control_rm,
+    
+    piezometer_install_rm =
+      piezometers_n *
+      manual_piezometer_install_rm,
+    
+    engagement_rm =
+      if_else(
+        treated_area_ha > 0,
+        engagement_rm_per_project,
+        0
+      ),
+    
+    capex_rm =
+      restoration_establishment_rm +
+      drain_assessment_rm +
+      drain_minor_works_rm +
+      simple_drain_blocks_rm +
+      engineered_controls_rm +
+      piezometer_install_rm +
+      engagement_rm,
+    
+    annual_piezometer_monitoring_rm =
+      piezometers_n *
+      manual_piezometer_monitoring_rm_per_year,
+    
+    annual_fire_prevention_rm =
+      fire_prevention_area_ha *
+      fire_prevention_rm_per_ha_per_year,
+    
+    annual_monitoring_reporting_rm =
+      if_else(
+        treated_area_ha > 0,
+        monitoring_reporting_rm_per_year,
+        0
+      ),
+    
+    annual_om_rm =
+      annual_piezometer_monitoring_rm +
+      annual_fire_prevention_rm +
+      annual_monitoring_reporting_rm,
+    
+    restoration_maintenance_pv_rm =
+      active_restoration_area_ha *
+      maintenance_rm_per_ha_per_year *
+      pv_maintenance_factor,
+    
+    pv_cost_rm =
+      capex_rm +
+      annual_om_rm *
+      pv_factor +
+      restoration_maintenance_pv_rm,
+    
+    annual_avoided_tco2e =
+      bmp_controlled_drainage_candidate *
+      baseline_drained_oil_palm_tco2e_ha_yr *
+      bmp_reduction_factor +
+      low_AGB_restoration_fire_risk_candidate *
+      baseline_degraded_drained_peat_tco2e_ha_yr *
+      low_agb_reduction_factor +
+      moderate_AGB_ANR_enrichment_candidate *
+      baseline_degraded_drained_peat_tco2e_ha_yr *
+      moderate_agb_reduction_factor +
+      high_AGB_canopy_protection_candidate *
+      baseline_degraded_drained_peat_tco2e_ha_yr *
+      high_agb_reduction_factor +
+      AGB_unclassified_restoration_candidate *
+      baseline_degraded_drained_peat_tco2e_ha_yr *
+      unclassified_agb_reduction_factor,
+    
+    pv_avoided_tco2e =
+      annual_avoided_tco2e *
+      pv_factor,
+    
+    annual_carbon_value_rm =
+      annual_avoided_tco2e *
+      carbon_rm_per_tco2e,
+    
+    pv_carbon_value_rm =
+      pv_avoided_tco2e *
+      carbon_rm_per_tco2e,
+    
+    npv_carbon_only_rm =
+      pv_carbon_value_rm -
+      pv_cost_rm,
+    
+    cost_rm_per_tco2e = if_else(
+      pv_avoided_tco2e > 0,
+      pv_cost_rm / pv_avoided_tco2e,
+      NA_real_
+    )
+  ) |>
+  select(
+    scenario,
+    buffer_m,
+    assumption_case,
+    
+    peat_area_ha,
+    eligible_peat_area_ha,
+    
+    bmp_controlled_drainage_candidate,
+    low_AGB_restoration_fire_risk_candidate,
+    moderate_AGB_ANR_enrichment_candidate,
+    high_AGB_canopy_protection_candidate,
+    AGB_unclassified_restoration_candidate,
+    active_restoration_area_ha,
+    canopy_protection_area_ha,
+    excluded_infrastructure_built_river_road,
+    non_peat_or_unconfirmed,
+    
+    drain_all_km,
+    drain_intervention_km,
+    drain_km_for_cost,
+    simple_drain_blocks_n,
+    engineered_controls_n,
+    piezometers_n,
+    hotspot_count_on_eligible_peat,
+    
+    capex_rm,
+    annual_om_rm,
+    restoration_maintenance_pv_rm,
+    pv_cost_rm,
+    
+    annual_avoided_tco2e,
+    pv_avoided_tco2e,
+    carbon_rm_per_tco2e,
+    annual_carbon_value_rm,
+    pv_carbon_value_rm,
+    npv_carbon_only_rm,
+    cost_rm_per_tco2e,
+    
+    everything()
+  )
+
+write_csv(
+  econ_summary,
+  file.path(cfg$out_dir, "binsuluk_fr_cost_benefit_sensitivity.csv")
+)
+
+econ_base <- econ_summary |>
+  filter(
+    assumption_case == "base"
+  )
+
+write_csv(
+  econ_base,
+  file.path(cfg$out_dir, "binsuluk_fr_cost_benefit_base_case.csv")
+)
+
+# ------------------------------------------------------------
+# 18. Save spatial outputs
+# ------------------------------------------------------------
+
+out_gpkg <- file.path(
+  cfg$out_dir,
+  "binsuluk_fr_intervention_envelopes.gpkg"
+)
+
+if (file.exists(out_gpkg)) {
+  unlink(out_gpkg)
+}
+
+st_write(
+  binsuluk_fr,
+  out_gpkg,
+  layer = "binsuluk_fr",
+  quiet = TRUE
+)
+
+st_write(
+  binsuluk_phu,
+  out_gpkg,
+  layer = "binsuluk_phu",
+  quiet = TRUE,
+  append = TRUE
+)
+
+st_write(
+  peat_mask,
+  out_gpkg,
+  layer = "peat_mask_klias",
+  quiet = TRUE,
+  append = TRUE
+)
+
+if (!is.null(nonpeat_mask)) {
+  st_write(
+    nonpeat_mask,
+    out_gpkg,
+    layer = "nonpeat_mask_kinabatangan_tuaran",
+    quiet = TRUE,
+    append = TRUE
+  )
+}
+
+st_write(
+  agb_classes,
+  out_gpkg,
+  layer = "agb_classes",
+  quiet = TRUE,
+  append = TRUE
+)
+
+st_write(
+  buffers_cumulative,
+  out_gpkg,
+  layer = "buffers_cumulative",
+  quiet = TRUE,
+  append = TRUE
+)
+
+st_write(
+  buffer_rings,
+  out_gpkg,
+  layer = "buffer_rings",
+  quiet = TRUE,
+  append = TRUE
+)
+
+if (nrow(intervention_classes) > 0) {
+  st_write(
+    intervention_classes,
+    out_gpkg,
+    layer = "intervention_classes",
+    quiet = TRUE,
+    append = TRUE
+  )
+}
+
+# ------------------------------------------------------------
+# 19. Console summary
+# ------------------------------------------------------------
+
+cat("\nFinished Binsuluk FR intervention-envelope analysis.\n")
+cat("Outputs saved to:\n")
+cat(cfg$out_dir, "\n\n")
+
+cat("Key outputs:\n")
+cat("- input_paths_used.csv\n")
+cat("- buffers_cumulative_area_summary.csv\n")
+cat("- buffer_rings_area_summary.csv\n")
+cat("- buffer_overlap_area_summary.csv\n")
+cat("- buffer_title_summary_broad_groups_long.csv\n")
+cat("- buffer_title_summary_broad_groups_wide.csv\n")
+cat("- intervention_class_area_summary.csv\n")
+cat("- drain_hotspot_summary.csv\n")
+cat("- economic_assumptions.csv\n")
+cat("- binsuluk_fr_cost_benefit_base_case.csv\n")
+cat("- binsuluk_fr_cost_benefit_sensitivity.csv\n")
+cat("- binsuluk_fr_intervention_envelopes.gpkg\n\n")
+
+cat("Scenarios included:\n")
+print(
+  buffers_cumulative |>
+    st_drop_geometry() |>
+    select(
+      scenario_type,
+      scenario,
+      buffer_m,
+      gross_area_ha
+    )
+)
